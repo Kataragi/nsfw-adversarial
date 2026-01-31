@@ -1,10 +1,11 @@
-"""Carlini & Wagner (C&W) attack implementation.
+"""Carlini & Wagner (C&W) L2 attack on images.
 
-C&W is an optimization-based adversarial attack that minimizes
-the perturbation norm while ensuring misclassification.
+Optimization-based attack that minimises the L2 perturbation while
+ensuring the classifier prediction drops below the decision boundary.
 
 Reference:
-    Carlini & Wagner, "Towards Evaluating the Robustness of Neural Networks", 2017
+    Carlini & Wagner, "Towards Evaluating the Robustness of Neural
+    Networks", 2017
 """
 
 import logging
@@ -23,13 +24,13 @@ class CWConfig:
 
     Attributes:
         c: Trade-off constant between perturbation and misclassification.
-        kappa: Confidence margin for misclassification.
-        iterations: Number of optimization iterations.
-        learning_rate: Adam optimizer learning rate.
+        kappa: Confidence margin.
+        iterations: Optimisation iterations per binary-search step.
+        learning_rate: Adam learning rate.
         binary_search_steps: Number of binary search steps for c.
         batch_size: Batch size for processing.
-        abort_early: Whether to abort if loss stops decreasing.
-        target_label: Target label for the attack.
+        abort_early: Abort if loss plateaus.
+        target_label: Target label (0.0 = SFW).
     """
 
     c: float = 1.0
@@ -37,113 +38,97 @@ class CWConfig:
     iterations: int = 500
     learning_rate: float = 0.01
     binary_search_steps: int = 9
-    batch_size: int = 64
+    batch_size: int = 4
     abort_early: bool = True
     target_label: float = 0.0
 
 
 class CWAttack:
-    """Carlini & Wagner L2 attack.
-
-    Finds minimal L2 perturbation that causes misclassification
-    using optimization with binary search over the trade-off constant.
+    """C&W L2 attack on images through the end-to-end pipeline.
 
     Args:
-        model: Target classifier model.
+        pipeline: EndToEndModel instance.
         config: C&W configuration.
     """
 
-    def __init__(self, model: tf.keras.Model, config: CWConfig | None = None) -> None:
-        self.model = model
+    def __init__(
+        self, pipeline: tf.keras.Model, config: CWConfig | None = None
+    ) -> None:
+        self.pipeline = pipeline
         self.config = config or CWConfig()
 
+    @staticmethod
     def _cw_loss(
-        self,
-        predictions: tf.Tensor,
-        target_label: float,
-        kappa: float,
+        predictions: tf.Tensor, target_label: float, kappa: float
     ) -> tf.Tensor:
-        """Compute C&W loss for binary classification.
-
-        For targeted attack toward SFW (label=0), we want predictions
-        to be low (close to 0).
-
-        Args:
-            predictions: Model predictions (NSFW probability).
-            target_label: Target label value.
-            kappa: Confidence margin.
-
-        Returns:
-            C&W loss tensor.
-        """
-        # For binary sigmoid output targeting label 0:
-        # We want to maximize (threshold - prediction), i.e., minimize prediction
-        # loss = max(prediction - threshold + kappa, 0)
+        """C&W classification loss: max(pred - target - kappa, 0)."""
         return tf.maximum(predictions - target_label - kappa, 0.0)
 
     def _attack_batch(
         self,
-        embeddings: np.ndarray,
+        images: np.ndarray,
         tb_writer: tf.summary.SummaryWriter | None = None,
         global_step: int = 0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run C&W attack on a batch.
-
-        Args:
-            embeddings: Batch of embeddings.
-            tb_writer: Optional TensorBoard writer.
-            global_step: Step counter for TensorBoard.
+        """Run C&W on one batch.
 
         Returns:
-            Tuple of (adversarial, noise, iterations_used).
+            (adversarial, noise, iterations_used)
         """
-        batch_size = len(embeddings)
+        batch_size = len(images)
         cfg = self.config
-        original = tf.constant(embeddings, dtype=tf.float32)
+        original = tf.constant(images, dtype=tf.float32)
 
-        best_adv = np.copy(embeddings)
+        best_adv = np.copy(images)
         best_l2 = np.full(batch_size, 1e10, dtype=np.float32)
         iterations_used = np.full(batch_size, cfg.iterations, dtype=np.int32)
 
-        # Binary search over c
         c_lower = np.zeros(batch_size, dtype=np.float32)
         c_upper = np.full(batch_size, cfg.c * 10, dtype=np.float32)
         c_current = np.full(batch_size, cfg.c, dtype=np.float32)
 
         for search_step in range(cfg.binary_search_steps):
-            # Initialize perturbation variable (in tanh space for unconstrained opt)
+            # w parameterises unconstrained perturbation (tanh space)
             w = tf.Variable(tf.zeros_like(original))
             optimizer = tf.keras.optimizers.Adam(learning_rate=cfg.learning_rate)
-
-            c_tensor = tf.constant(c_current.reshape(-1, 1), dtype=tf.float32)
+            c_tensor = tf.constant(
+                c_current.reshape(-1, 1, 1, 1), dtype=tf.float32
+            )
 
             prev_loss = 1e10
 
             for step in range(cfg.iterations):
                 with tf.GradientTape() as tape:
-                    # Perturbation via tanh transformation
                     perturbation = tf.tanh(w) * 0.5
-                    adv = original + perturbation
+                    adv = tf.clip_by_value(original + perturbation, 0.0, 1.0)
 
-                    predictions = self.model(adv, training=False)
+                    predictions = self.pipeline(adv, training=False)
 
-                    # L2 distance
-                    l2_dist = tf.reduce_sum(tf.square(perturbation), axis=1, keepdims=True)
+                    # L2 over spatial dims
+                    l2_dist = tf.reduce_sum(
+                        tf.square(perturbation),
+                        axis=[1, 2, 3],
+                        keepdims=True,
+                    )
 
-                    # Classification loss
-                    cls_loss = self._cw_loss(predictions, cfg.target_label, cfg.kappa)
-
-                    # Total loss
-                    total_loss = l2_dist + c_tensor * cls_loss
+                    cls_loss = self._cw_loss(
+                        predictions, cfg.target_label, cfg.kappa
+                    )
+                    # cls_loss is (N,1); broadcast c
+                    c_broad = tf.reshape(
+                        tf.constant(c_current, dtype=tf.float32), [-1, 1]
+                    )
+                    total_loss = tf.squeeze(l2_dist, axis=[2, 3]) + c_broad * cls_loss
                     loss = tf.reduce_sum(total_loss)
 
-                optimizer.apply_gradients([(tape.gradient(loss, w), w)])
+                grad = tape.gradient(loss, w)
+                optimizer.apply_gradients([(grad, w)])
 
-                # Track progress
                 current_preds = predictions.numpy().flatten()
-                current_l2 = np.sqrt(l2_dist.numpy().flatten())
+                current_l2 = np.sqrt(
+                    l2_dist.numpy().reshape(batch_size, -1).sum(axis=1)
+                )
 
-                # Update best results
                 success = current_preds < 0.5
                 improved = success & (current_l2 < best_l2)
                 for j in range(batch_size):
@@ -154,86 +139,79 @@ class CWAttack:
                             search_step * cfg.iterations + step + 1
                         )
 
-                # TensorBoard logging
                 if tb_writer is not None and step % 50 == 0:
                     with tb_writer.as_default():
                         s = global_step + search_step * cfg.iterations + step
                         tf.summary.scalar("cw/loss", float(loss), step=s)
                         tf.summary.scalar(
-                            "cw/avg_pred", float(np.mean(current_preds)), step=s
-                        )
-                        tf.summary.scalar(
-                            "cw/avg_l2", float(np.mean(current_l2)), step=s
+                            "cw/avg_pred",
+                            float(current_preds.mean()),
+                            step=s,
                         )
 
-                # Abort early if loss plateaus
                 if cfg.abort_early and step % 100 == 0:
                     current_loss_val = float(loss)
                     if current_loss_val > prev_loss * 0.9999:
-                        logger.debug(
-                            "Early abort at search=%d, step=%d",
-                            search_step, step,
-                        )
                         break
                     prev_loss = current_loss_val
 
-            # Update c via binary search
-            final_preds = self.model(
-                tf.constant(best_adv, dtype=tf.float32), training=False
-            ).numpy().flatten()
-
+            # Binary search update
+            final_preds = (
+                self.pipeline(
+                    tf.constant(best_adv, dtype=tf.float32), training=False
+                )
+                .numpy()
+                .flatten()
+            )
             for j in range(batch_size):
-                if final_preds[j] < 0.5:  # Attack succeeded
+                if final_preds[j] < 0.5:
                     c_upper[j] = min(c_upper[j], c_current[j])
-                    c_current[j] = (c_lower[j] + c_upper[j]) / 2
-                else:  # Attack failed
+                else:
                     c_lower[j] = max(c_lower[j], c_current[j])
-                    c_current[j] = (c_lower[j] + c_upper[j]) / 2
+                c_current[j] = (c_lower[j] + c_upper[j]) / 2
 
-        noise = best_adv - embeddings
+        noise = best_adv - images
         return best_adv, noise, iterations_used
 
     def attack(
         self,
-        embeddings: np.ndarray,
+        images: np.ndarray,
         tb_writer: tf.summary.SummaryWriter | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run C&W attack on all embeddings.
+        """Run C&W attack on all images.
 
         Args:
-            embeddings: Original embeddings of shape (N, 256).
+            images: (N, H, W, 3) float32 in [0, 1].
             tb_writer: Optional TensorBoard writer.
 
         Returns:
-            Tuple of (adversarial_embeddings, noise, iterations_per_sample).
+            (adversarial_images, noise, iterations_per_sample)
         """
-        n_samples = len(embeddings)
-        batch_size = self.config.batch_size
+        n = len(images)
+        cfg = self.config
 
         logger.info(
-            "Running C&W attack: c=%.4f, kappa=%.1f, iterations=%d, samples=%d",
-            self.config.c, self.config.kappa, self.config.iterations, n_samples,
+            "Running C&W attack: c=%.4f, kappa=%.1f, iters=%d, samples=%d",
+            cfg.c, cfg.kappa, cfg.iterations, n,
         )
 
-        all_adversarial = np.zeros_like(embeddings)
-        all_noise = np.zeros_like(embeddings)
-        all_iterations = np.zeros(n_samples, dtype=np.int32)
+        all_adv = np.zeros_like(images)
+        all_noise = np.zeros_like(images)
+        all_iters = np.zeros(n, dtype=np.int32)
 
-        n_batches = (n_samples + batch_size - 1) // batch_size
+        n_batches = (n + cfg.batch_size - 1) // cfg.batch_size
 
         for i in tqdm(range(n_batches), desc="C&W Attack", unit="batch"):
-            start = i * batch_size
-            end = min(start + batch_size, n_samples)
-            batch = embeddings[start:end]
-
+            start = i * cfg.batch_size
+            end = min(start + cfg.batch_size, n)
             adv, noise, iters = self._attack_batch(
-                batch, tb_writer=tb_writer,
-                global_step=i * self.config.binary_search_steps * self.config.iterations,
+                images[start:end],
+                tb_writer=tb_writer,
+                global_step=i * cfg.binary_search_steps * cfg.iterations,
             )
-
-            all_adversarial[start:end] = adv
+            all_adv[start:end] = adv
             all_noise[start:end] = noise
-            all_iterations[start:end] = iters
+            all_iters[start:end] = iters
 
         logger.info("C&W attack complete")
-        return all_adversarial, all_noise, all_iterations
+        return all_adv, all_noise, all_iters

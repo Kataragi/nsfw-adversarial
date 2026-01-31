@@ -1,38 +1,33 @@
-"""Robustness evaluation script.
+"""Robustness evaluation script (image-based).
 
 Runs multiple attack methods with varying parameters and generates
-comprehensive evaluation reports with visualizations.
+comprehensive evaluation reports with visualisations.
 
 Usage:
     python src/evaluate_robustness.py \
-        --target-model MODEL \
-        --embeddings-dir DIR \
+        --images-dir dataset/nsfw_images \
         --methods fgsm pgd cw deepfool \
-        --epsilon-range 0.01 0.05 0.1
+        --epsilon-range 0.01 0.02 0.031 0.063
 """
 
 import argparse
-import json
 import logging
 import os
-from datetime import datetime
 from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
 import tensorflow as tf
 from tqdm import tqdm
 
-from src.embedding_attacker import EmbeddingAttacker
+from src.image_attacker import ImageAttacker
+from src.pipeline import build_pipeline
 from src.utils import (
     detect_gpu,
     load_config,
-    load_embeddings,
-    load_target_model,
-    predict_batch,
+    load_images,
     save_results,
     set_seed,
     setup_logging,
@@ -44,201 +39,147 @@ logger = logging.getLogger(__name__)
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Robustness Evaluation for NSFW Classifier",
+        description="Robustness Evaluation (image-based)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--images-dir", type=str, required=True)
     parser.add_argument(
-        "--target-model", type=str, required=True,
-        help="Path to target classifier model",
+        "--classifier-model", type=str,
+        default="models/target_classifier/pnsfwmedia_classifier.keras",
     )
     parser.add_argument(
-        "--embeddings-dir", type=str, required=True,
-        help="Directory containing embeddings",
+        "--projection-path", type=str,
+        default="models/nudenet_projection.npy",
     )
+    parser.add_argument("--nudenet-onnx", type=str, default=None)
+    parser.add_argument("--backbone-cache", type=str, default="models/tf_backbone")
     parser.add_argument(
         "--methods", type=str, nargs="+",
         default=["fgsm", "pgd", "cw", "deepfool"],
-        help="Attack methods to evaluate",
     )
     parser.add_argument(
         "--epsilon-range", type=float, nargs="+",
-        default=[0.01, 0.03, 0.05, 0.07, 0.1],
-        help="Epsilon values to test",
+        default=[4 / 255, 8 / 255, 16 / 255, 32 / 255],
     )
     parser.add_argument(
-        "--output-dir", type=str,
-        default="experiments/robustness_analysis",
-        help="Output directory for results",
+        "--output-dir", type=str, default="experiments/robustness_analysis",
     )
-    parser.add_argument(
-        "--config", type=str, default="config/attack_config.yaml",
-        help="Configuration file path",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="Random seed",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=256, help="Batch size",
-    )
+    parser.add_argument("--config", type=str, default="config/attack_config.yaml")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
-    parser.add_argument(
-        "--max-samples", type=int, default=None,
-        help="Maximum number of samples to evaluate (for quick tests)",
-    )
+    parser.add_argument("--max-images", type=int, default=None)
     return parser.parse_args(argv)
 
 
+# ── sweeps ─────────────────────────────────────────────────────────
+
+
 def run_epsilon_sweep(
-    attacker: EmbeddingAttacker,
-    embeddings: np.ndarray,
+    attacker: ImageAttacker,
+    images: np.ndarray,
     method: str,
     epsilons: list[float],
     output_dir: str,
-    batch_size: int = 256,
+    batch_size: int = 8,
+    filenames: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run attack with multiple epsilon values.
-
-    Args:
-        attacker: EmbeddingAttacker instance.
-        embeddings: Input embeddings.
-        method: Attack method name.
-        epsilons: List of epsilon values.
-        output_dir: Output directory.
-        batch_size: Batch size.
-
-    Returns:
-        List of result dictionaries for each epsilon.
-    """
+    """Sweep epsilon values for FGSM/PGD."""
     results_list = []
 
     for eps in tqdm(epsilons, desc=f"{method.upper()} epsilon sweep"):
         kwargs: dict[str, Any] = {"epsilon": eps, "batch_size": batch_size}
-
         if method == "pgd":
             kwargs["alpha"] = eps / 4
             kwargs["iterations"] = 20
 
         method_dir = os.path.join(output_dir, method, f"eps_{eps:.4f}")
-
         try:
-            results = attacker.run_attack(
-                method=method,
-                embeddings=embeddings,
-                output_dir=method_dir,
-                **kwargs,
+            r = attacker.run_attack(
+                method=method, images=images, output_dir=method_dir,
+                filenames=filenames, **kwargs,
             )
-            results["epsilon"] = eps
-            results_list.append(results)
+            r["epsilon"] = eps
+            results_list.append(r)
         except Exception:
             logger.exception("Failed: %s eps=%.4f", method, eps)
 
     return results_list
 
 
-def run_deepfool_sweep(
-    attacker: EmbeddingAttacker,
-    embeddings: np.ndarray,
-    output_dir: str,
-) -> list[dict[str, Any]]:
-    """Run DeepFool with varying overshoot values.
-
-    Args:
-        attacker: EmbeddingAttacker instance.
-        embeddings: Input embeddings.
-        output_dir: Output directory.
-
-    Returns:
-        List of result dictionaries.
-    """
-    overshoots = [0.02, 0.05, 0.1]
-    results_list = []
-
-    for ov in tqdm(overshoots, desc="DeepFool overshoot sweep"):
-        method_dir = os.path.join(output_dir, "deepfool", f"overshoot_{ov:.3f}")
-        try:
-            results = attacker.run_attack(
-                method="deepfool",
-                embeddings=embeddings,
-                output_dir=method_dir,
-                overshoot=ov,
-                max_iterations=100,
-            )
-            results["overshoot"] = ov
-            results_list.append(results)
-        except Exception:
-            logger.exception("Failed: deepfool overshoot=%.3f", ov)
-
-    return results_list
-
-
 def run_cw_sweep(
-    attacker: EmbeddingAttacker,
-    embeddings: np.ndarray,
+    attacker: ImageAttacker,
+    images: np.ndarray,
     output_dir: str,
-    batch_size: int = 64,
+    batch_size: int = 4,
+    filenames: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run C&W with varying c values.
-
-    Args:
-        attacker: EmbeddingAttacker instance.
-        embeddings: Input embeddings.
-        output_dir: Output directory.
-        batch_size: Batch size.
-
-    Returns:
-        List of result dictionaries.
-    """
+    """Sweep c values for C&W."""
     c_values = [0.1, 1.0, 10.0]
     results_list = []
-
     for c in tqdm(c_values, desc="C&W c sweep"):
         method_dir = os.path.join(output_dir, "cw", f"c_{c:.2f}")
         try:
-            results = attacker.run_attack(
-                method="cw",
-                embeddings=embeddings,
-                output_dir=method_dir,
-                c=c,
-                iterations=500,
-                batch_size=batch_size,
+            r = attacker.run_attack(
+                method="cw", images=images, output_dir=method_dir,
+                filenames=filenames, c=c, iterations=500, batch_size=batch_size,
             )
-            results["c"] = c
-            results_list.append(results)
+            r["c"] = c
+            results_list.append(r)
         except Exception:
             logger.exception("Failed: cw c=%.2f", c)
-
     return results_list
 
 
-def plot_epsilon_vs_success_rate(
-    all_results: dict[str, list[dict[str, Any]]],
+def run_deepfool_sweep(
+    attacker: ImageAttacker,
+    images: np.ndarray,
     output_dir: str,
-) -> None:
-    """Plot success rate vs epsilon for each attack method.
+    filenames: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Sweep overshoot values for DeepFool."""
+    overshoots = [0.02, 0.05, 0.1]
+    results_list = []
+    for ov in tqdm(overshoots, desc="DeepFool overshoot sweep"):
+        method_dir = os.path.join(output_dir, "deepfool", f"overshoot_{ov:.3f}")
+        try:
+            r = attacker.run_attack(
+                method="deepfool", images=images, output_dir=method_dir,
+                filenames=filenames, overshoot=ov, max_iterations=100,
+            )
+            r["overshoot"] = ov
+            results_list.append(r)
+        except Exception:
+            logger.exception("Failed: deepfool ov=%.3f", ov)
+    return results_list
 
-    Args:
-        all_results: Results grouped by method.
-        output_dir: Directory to save plots.
-    """
+
+# ── visualisation ──────────────────────────────────────────────────
+
+
+def plot_epsilon_vs_success_rate(
+    all_results: dict[str, list[dict[str, Any]]], output_dir: str
+) -> None:
+    """Success rate vs epsilon for FGSM/PGD."""
     os.makedirs(output_dir, exist_ok=True)
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    thresholds = [0.5, 0.4, 0.3]
 
-    for ax, threshold in zip(axes, thresholds):
-        for method, results_list in all_results.items():
+    for ax, threshold in zip(axes, [0.5, 0.4, 0.3]):
+        for method, rlist in all_results.items():
             if method in ("deepfool", "cw"):
                 continue
-            epsilons = [r.get("epsilon", 0) for r in results_list]
+            epsilons = [r.get("epsilon", 0) for r in rlist]
             rates = [
                 r.get("results", {}).get(f"success_rate_{threshold}", 0)
-                for r in results_list
+                for r in rlist
             ]
-            ax.plot(epsilons, rates, "o-", label=method.upper(), linewidth=2)
+            eps_px = [e * 255 for e in epsilons]
+            ax.plot(eps_px, rates, "o-", label=method.upper(), linewidth=2)
 
-        ax.set_xlabel("Epsilon (ε)", fontsize=12)
+        ax.set_xlabel("Epsilon (pixel /255)", fontsize=12)
         ax.set_ylabel("Success Rate", fontsize=12)
         ax.set_title(f"Threshold = {threshold}", fontsize=14)
         ax.legend(fontsize=11)
@@ -256,32 +197,20 @@ def plot_epsilon_vs_success_rate(
 
 
 def plot_probability_distributions(
-    model: tf.keras.Model,
-    embeddings: np.ndarray,
+    pipeline: tf.keras.Model,
+    images: np.ndarray,
     all_results: dict[str, list[dict[str, Any]]],
     output_dir: str,
 ) -> None:
-    """Plot before/after probability distributions.
-
-    Args:
-        model: Target model.
-        embeddings: Original embeddings.
-        all_results: Attack results.
-        output_dir: Output directory.
-    """
+    """Before/after probability distributions."""
     os.makedirs(output_dir, exist_ok=True)
-    original_probs = predict_batch(model, embeddings)
+    original_probs = pipeline.predict_images(images)
 
-    # Find best epsilon result for each method
     methods_to_plot = []
-    for method, results_list in all_results.items():
-        if not results_list:
+    for method, rlist in all_results.items():
+        if not rlist:
             continue
-        # Pick the result with highest success rate at 0.5
-        best = max(
-            results_list,
-            key=lambda r: r.get("results", {}).get("success_rate_0.5", 0),
-        )
+        best = max(rlist, key=lambda r: r.get("results", {}).get("success_rate_0.5", 0))
         methods_to_plot.append((method, best))
 
     n_plots = len(methods_to_plot) + 1
@@ -289,7 +218,6 @@ def plot_probability_distributions(
     if n_plots == 1:
         axes = [axes]
 
-    # Original distribution
     axes[0].hist(original_probs, bins=50, alpha=0.7, color="blue", edgecolor="black")
     axes[0].axvline(x=0.5, color="red", linestyle="--", label="Threshold")
     axes[0].set_title("Original", fontsize=12)
@@ -298,33 +226,18 @@ def plot_probability_distributions(
     axes[0].legend()
 
     for idx, (method, best_result) in enumerate(methods_to_plot, 1):
-        params = best_result.get("parameters", {})
-        # Load adversarial embeddings if available
-        eps = best_result.get("epsilon", params.get("epsilon", "?"))
-        method_dir = os.path.join(
-            output_dir, "..", method, f"eps_{eps:.4f}" if isinstance(eps, float) else method
-        )
-        adv_path = os.path.join(method_dir, f"{method}_embeddings.npy")
-
-        if os.path.exists(adv_path):
-            adv_embeddings = np.load(adv_path)
-            adv_probs = predict_batch(model, adv_embeddings)
-        else:
-            # Use metrics from results
-            adv_probs = None
-
-        if adv_probs is not None:
-            axes[idx].hist(
-                adv_probs, bins=50, alpha=0.7, color="orange", edgecolor="black"
-            )
-
-        axes[idx].axvline(x=0.5, color="red", linestyle="--", label="Threshold")
         sr = best_result.get("results", {}).get("success_rate_0.5", "N/A")
-        axes[idx].set_title(f"{method.upper()} (SR={sr:.2%})" if isinstance(sr, float) else f"{method.upper()}", fontsize=12)
+        title = (
+            f"{method.upper()} (SR={sr:.2%})"
+            if isinstance(sr, float)
+            else f"{method.upper()}"
+        )
+        axes[idx].axvline(x=0.5, color="red", linestyle="--", label="Threshold")
+        axes[idx].set_title(title, fontsize=12)
         axes[idx].set_xlabel("NSFW Probability")
         axes[idx].legend()
 
-    plt.suptitle("Probability Distribution: Before vs After Attack", fontsize=14, y=1.02)
+    plt.suptitle("Probability Distribution: Before vs After", fontsize=14, y=1.02)
     plt.tight_layout()
     plt.savefig(
         os.path.join(output_dir, "probability_distributions.png"),
@@ -334,79 +247,24 @@ def plot_probability_distributions(
     logger.info("Saved probability_distributions.png")
 
 
-def plot_noise_distributions(
-    all_results: dict[str, list[dict[str, Any]]],
-    output_dir: str,
-) -> None:
-    """Plot noise norm distributions across methods.
-
-    Args:
-        all_results: Attack results.
-        output_dir: Output directory.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    methods = []
-    l2_norms = []
-    linf_norms = []
-
-    for method, results_list in all_results.items():
-        for r in results_list:
-            metrics = r.get("results", {})
-            if "avg_l2_norm" in metrics:
-                methods.append(method.upper())
-                l2_norms.append(metrics["avg_l2_norm"])
-                linf_norms.append(metrics.get("avg_linf_norm", 0))
-
-    if not methods:
-        return
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    ax1.bar(range(len(methods)), l2_norms, tick_label=methods, color="steelblue")
-    ax1.set_title("Average L2 Norm of Perturbation", fontsize=12)
-    ax1.set_ylabel("L2 Norm")
-    ax1.tick_params(axis="x", rotation=45)
-
-    ax2.bar(range(len(methods)), linf_norms, tick_label=methods, color="coral")
-    ax2.set_title("Average L-inf Norm of Perturbation", fontsize=12)
-    ax2.set_ylabel("L-inf Norm")
-    ax2.tick_params(axis="x", rotation=45)
-
-    plt.tight_layout()
-    plt.savefig(
-        os.path.join(output_dir, "noise_distributions.png"),
-        dpi=150, bbox_inches="tight",
-    )
-    plt.close()
-    logger.info("Saved noise_distributions.png")
-
-
 def plot_comparison_table(
-    all_results: dict[str, list[dict[str, Any]]],
-    output_dir: str,
+    all_results: dict[str, list[dict[str, Any]]], output_dir: str
 ) -> None:
-    """Generate a comparison summary table as an image.
-
-    Args:
-        all_results: Attack results.
-        output_dir: Output directory.
-    """
+    """Comparison summary table as image."""
     os.makedirs(output_dir, exist_ok=True)
-
     rows = []
-    for method, results_list in all_results.items():
-        for r in results_list:
-            metrics = r.get("results", {})
-            params = r.get("parameters", {})
-            eps = r.get("epsilon", params.get("epsilon", "-"))
+    for method, rlist in all_results.items():
+        for r in rlist:
+            m = r.get("results", {})
+            eps = r.get("epsilon", r.get("c", r.get("overshoot", "-")))
+            eps_str = f"{eps * 255:.1f}/255" if isinstance(eps, float) and eps < 1 else str(eps)
             rows.append([
                 method.upper(),
-                f"{eps}" if isinstance(eps, (int, float)) else eps,
-                f"{metrics.get('success_rate_0.5', 0):.2%}",
-                f"{metrics.get('success_rate_0.3', 0):.2%}",
-                f"{metrics.get('avg_prob_reduction', 0):.4f}",
-                f"{metrics.get('avg_l2_norm', 0):.6f}",
+                eps_str,
+                f"{m.get('success_rate_0.5', 0):.2%}",
+                f"{m.get('success_rate_0.3', 0):.2%}",
+                f"{m.get('avg_prob_reduction', 0):.4f}",
+                f"{m.get('avg_linf_norm_pixel', 0):.2f}",
             ])
 
     if not rows:
@@ -414,19 +272,11 @@ def plot_comparison_table(
 
     fig, ax = plt.subplots(figsize=(14, max(3, len(rows) * 0.4 + 1)))
     ax.axis("off")
-
-    headers = ["Method", "ε", "SR@0.5", "SR@0.3", "Avg ΔP", "Avg L2"]
-    table = ax.table(
-        cellText=rows,
-        colLabels=headers,
-        loc="center",
-        cellLoc="center",
-    )
+    headers = ["Method", "Param", "SR@0.5", "SR@0.3", "Avg dP", "L-inf(px)"]
+    table = ax.table(cellText=rows, colLabels=headers, loc="center", cellLoc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(10)
     table.scale(1.2, 1.5)
-
-    # Style header
     for j in range(len(headers)):
         table[(0, j)].set_facecolor("#4472C4")
         table[(0, j)].set_text_props(color="white", weight="bold")
@@ -440,8 +290,11 @@ def plot_comparison_table(
     logger.info("Saved comparison_table.png")
 
 
+# ── main ───────────────────────────────────────────────────────────
+
+
 def main(argv: list[str] | None = None) -> None:
-    """Main entry point for robustness evaluation."""
+    """Main entry point."""
     args = parse_args(argv)
 
     setup_logging(args.log_level)
@@ -449,79 +302,76 @@ def main(argv: list[str] | None = None) -> None:
     detect_gpu()
 
     logger.info("=" * 60)
-    logger.info("Robustness Evaluation")
+    logger.info("Robustness Evaluation (image-based)")
     logger.info("Methods: %s", args.methods)
     logger.info("Epsilon range: %s", args.epsilon_range)
     logger.info("=" * 60)
 
-    # Load
-    model = load_target_model(args.target_model)
-    embeddings = load_embeddings(args.embeddings_dir)
+    # Build pipeline
+    pipeline = build_pipeline(
+        nudenet_onnx_path=args.nudenet_onnx,
+        projection_path=args.projection_path,
+        classifier_path=args.classifier_model,
+        backbone_cache_dir=args.backbone_cache,
+    )
 
-    if args.max_samples and len(embeddings) > args.max_samples:
-        logger.info("Limiting to %d samples", args.max_samples)
-        embeddings = embeddings[:args.max_samples]
+    # Load images
+    images, filenames = load_images(args.images_dir, max_images=args.max_images)
 
-    config = {}
+    config: dict = {}
     try:
         config = load_config(args.config)
     except FileNotFoundError:
         logger.warning("Config not found, using defaults")
 
-    attacker = EmbeddingAttacker(model, config)
+    attacker = ImageAttacker(pipeline, config)
     vis_dir = os.path.join(args.output_dir, "visualizations")
     all_results: dict[str, list[dict[str, Any]]] = {}
 
-    # Run epsilon sweeps for gradient methods
     for method in args.methods:
         if method in ("fgsm", "pgd"):
-            results = run_epsilon_sweep(
-                attacker, embeddings, method,
-                args.epsilon_range, args.output_dir, args.batch_size,
+            all_results[method] = run_epsilon_sweep(
+                attacker, images, method, args.epsilon_range,
+                args.output_dir, args.batch_size, filenames,
             )
-            all_results[method] = results
         elif method == "cw":
-            results = run_cw_sweep(
-                attacker, embeddings, args.output_dir,
-                batch_size=min(64, args.batch_size),
+            all_results["cw"] = run_cw_sweep(
+                attacker, images, args.output_dir,
+                batch_size=min(4, args.batch_size), filenames=filenames,
             )
-            all_results["cw"] = results
         elif method == "deepfool":
-            results = run_deepfool_sweep(
-                attacker, embeddings, args.output_dir,
+            all_results["deepfool"] = run_deepfool_sweep(
+                attacker, images, args.output_dir, filenames=filenames,
             )
-            all_results["deepfool"] = results
 
-    # Generate visualizations
-    logger.info("Generating visualizations...")
+    # Visualisations
+    logger.info("Generating visualisations...")
     plot_epsilon_vs_success_rate(all_results, vis_dir)
-    plot_probability_distributions(model, embeddings, all_results, vis_dir)
-    plot_noise_distributions(all_results, vis_dir)
+    plot_probability_distributions(pipeline, images, all_results, vis_dir)
     plot_comparison_table(all_results, vis_dir)
 
-    # Save combined results
-    combined = {
-        method: results_list
-        for method, results_list in all_results.items()
-    }
     save_results(
-        combined, args.output_dir, prefix="robustness_analysis"
+        {m: rl for m, rl in all_results.items()},
+        args.output_dir, prefix="robustness_analysis",
     )
 
-    # Print summary
+    # Summary
     print("\n" + "=" * 60)
     print("ROBUSTNESS EVALUATION SUMMARY")
     print("=" * 60)
-    for method, results_list in all_results.items():
+    for method, rlist in all_results.items():
         print(f"\n--- {method.upper()} ---")
-        for r in results_list:
-            metrics = r.get("results", {})
+        for r in rlist:
+            m = r.get("results", {})
             eps = r.get("epsilon", r.get("overshoot", r.get("c", "?")))
-            sr = metrics.get("success_rate_0.5", 0)
-            print(f"  param={eps}: SR@0.5={sr:.2%}")
+            sr = m.get("success_rate_0.5", 0)
+            if isinstance(eps, float) and eps < 1:
+                print(f"  eps={eps * 255:.1f}/255: SR@0.5={sr:.2%}")
+            else:
+                print(f"  param={eps}: SR@0.5={sr:.2%}")
 
     print(f"\nResults saved to: {args.output_dir}")
-    print(f"Visualizations saved to: {vis_dir}")
+    print(f"Visualisations: {vis_dir}")
     print("=" * 60)
 
 

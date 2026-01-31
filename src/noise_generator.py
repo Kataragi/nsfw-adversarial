@@ -1,19 +1,18 @@
-"""Command-line interface for adversarial noise generation.
+"""Command-line interface for adversarial noise generation on images.
 
 Usage:
-    python src/noise_generator.py --method fgsm --target-model MODEL --embeddings-dir DIR
+    python src/noise_generator.py --method fgsm --images-dir dataset/nsfw_images
 """
 
 import argparse
 import logging
-import sys
 
-from src.embedding_attacker import EmbeddingAttacker
+from src.image_attacker import ImageAttacker
+from src.pipeline import build_pipeline
 from src.utils import (
     detect_gpu,
     load_config,
-    load_embeddings,
-    load_target_model,
+    load_images,
     set_seed,
     setup_logging,
 )
@@ -22,139 +21,98 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse command-line arguments.
-
-    Args:
-        argv: Optional argument list (defaults to sys.argv).
-
-    Returns:
-        Parsed arguments namespace.
-    """
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Adversarial Noise Generator for NSFW Classifier",
+        description="Adversarial Noise Generator for NSFW Classifier (image-based)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Required arguments
+    # Required
     parser.add_argument(
-        "--method",
-        type=str,
-        required=True,
+        "--method", type=str, required=True,
         choices=["fgsm", "pgd", "cw", "deepfool"],
-        help="Attack method to use",
+        help="Attack method",
     )
     parser.add_argument(
-        "--target-model",
-        type=str,
-        required=True,
-        help="Path to target classifier model (.keras)",
+        "--images-dir", type=str, required=True,
+        help="Directory containing NSFW images to attack",
+    )
+
+    # Pipeline paths
+    parser.add_argument(
+        "--classifier-model", type=str,
+        default="models/target_classifier/pnsfwmedia_classifier.keras",
+        help="Path to pNSFWMedia classifier (.keras)",
     )
     parser.add_argument(
-        "--embeddings-dir",
-        type=str,
-        required=True,
-        help="Directory containing embedding files (.npy/.npz)",
+        "--projection-path", type=str,
+        default="models/nudenet_projection.npy",
+        help="Path to projection matrix (.npy)",
+    )
+    parser.add_argument(
+        "--nudenet-onnx", type=str, default=None,
+        help="Path to NudeNet ONNX model (auto-detect if omitted)",
+    )
+    parser.add_argument(
+        "--backbone-cache", type=str, default="models/tf_backbone",
+        help="Directory to cache converted TF backbone",
     )
 
     # Output
     parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="experiments/attack_results",
+        "--output-dir", type=str, default="experiments/attack_results",
         help="Directory to save results",
     )
     parser.add_argument(
-        "--config",
-        type=str,
-        default="config/attack_config.yaml",
-        help="Path to configuration file",
+        "--config", type=str, default="config/attack_config.yaml",
+        help="YAML configuration file",
     )
 
-    # Common attack parameters
+    # Common parameters
     parser.add_argument(
-        "--epsilon", type=float, default=0.05,
-        help="Maximum perturbation (L-inf norm)",
+        "--epsilon", type=float, default=8 / 255,
+        help="L-inf perturbation budget (pixel scale [0,1])",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=256,
-        help="Batch size for processing",
+        "--batch-size", type=int, default=8,
+        help="Batch size",
     )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for reproducibility",
-    )
-
-    # PGD-specific
-    parser.add_argument(
-        "--alpha", type=float, default=0.01,
-        help="PGD step size per iteration",
-    )
-    parser.add_argument(
-        "--iterations", type=int, default=20,
-        help="Number of attack iterations (PGD/C&W)",
-    )
-    parser.add_argument(
-        "--random-start", action="store_true", default=True,
-        help="PGD: random initialization within epsilon-ball",
+        "--max-images", type=int, default=None,
+        help="Limit number of images (for quick tests)",
     )
 
-    # C&W-specific
-    parser.add_argument(
-        "--cw-c", type=float, default=1.0,
-        help="C&W: trade-off constant",
-    )
-    parser.add_argument(
-        "--cw-kappa", type=float, default=0.0,
-        help="C&W: confidence margin",
-    )
-    parser.add_argument(
-        "--cw-lr", type=float, default=0.01,
-        help="C&W: optimizer learning rate",
-    )
-    parser.add_argument(
-        "--binary-search-steps", type=int, default=9,
-        help="C&W: binary search steps for c",
-    )
+    # PGD
+    parser.add_argument("--alpha", type=float, default=2 / 255, help="PGD step size")
+    parser.add_argument("--iterations", type=int, default=20, help="PGD/CW iterations")
+    parser.add_argument("--random-start", action="store_true", default=True)
 
-    # DeepFool-specific
-    parser.add_argument(
-        "--max-iterations", type=int, default=100,
-        help="DeepFool: maximum iterations",
-    )
-    parser.add_argument(
-        "--overshoot", type=float, default=0.02,
-        help="DeepFool: overshoot parameter",
-    )
+    # C&W
+    parser.add_argument("--cw-c", type=float, default=1.0, help="C&W trade-off")
+    parser.add_argument("--cw-kappa", type=float, default=0.0, help="C&W confidence")
+    parser.add_argument("--cw-lr", type=float, default=0.01, help="C&W learning rate")
+    parser.add_argument("--binary-search-steps", type=int, default=9)
+
+    # DeepFool
+    parser.add_argument("--max-iterations", type=int, default=100)
+    parser.add_argument("--overshoot", type=float, default=0.02)
 
     # TensorBoard
-    parser.add_argument(
-        "--tensorboard", action="store_true", default=False,
-        help="Enable TensorBoard logging",
-    )
-    parser.add_argument(
-        "--tb-log-dir", type=str, default="logs",
-        help="TensorBoard log directory",
-    )
+    parser.add_argument("--tensorboard", action="store_true", default=False)
+    parser.add_argument("--tb-log-dir", type=str, default="logs")
 
     # Logging
     parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level",
     )
 
     return parser.parse_args(argv)
 
 
 def build_attack_kwargs(args: argparse.Namespace) -> dict:
-    """Build attack-specific keyword arguments from parsed args.
-
-    Args:
-        args: Parsed command-line arguments.
-
-    Returns:
-        Dictionary of attack parameters.
-    """
+    """Map CLI args to attack-specific kwargs."""
     method = args.method
     kwargs: dict = {"batch_size": args.batch_size}
 
@@ -182,48 +140,52 @@ def build_attack_kwargs(args: argparse.Namespace) -> dict:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Main entry point for the noise generator CLI.
-
-    Args:
-        argv: Optional argument list.
-    """
+    """Main entry point."""
     args = parse_args(argv)
 
-    # Setup
     setup_logging(args.log_level)
     set_seed(args.seed)
     detect_gpu()
 
     logger.info("=" * 60)
-    logger.info("Adversarial Noise Generator")
+    logger.info("Adversarial Noise Generator (image-based)")
     logger.info("Method: %s", args.method.upper())
-    logger.info("Target model: %s", args.target_model)
-    logger.info("Embeddings: %s", args.embeddings_dir)
+    logger.info("Images: %s", args.images_dir)
     logger.info("=" * 60)
 
-    # Load model and embeddings
-    model = load_target_model(args.target_model)
-    embeddings = load_embeddings(args.embeddings_dir)
+    # Build end-to-end pipeline
+    pipeline = build_pipeline(
+        nudenet_onnx_path=args.nudenet_onnx,
+        projection_path=args.projection_path,
+        classifier_path=args.classifier_model,
+        backbone_cache_dir=args.backbone_cache,
+    )
 
-    # Configuration
-    config = {}
+    # Load images
+    images, filenames = load_images(
+        args.images_dir, max_images=args.max_images,
+    )
+
+    # Config
+    config: dict = {}
     try:
         config = load_config(args.config)
     except FileNotFoundError:
-        logger.warning("Config file not found: %s, using defaults", args.config)
+        logger.warning("Config not found: %s, using defaults", args.config)
 
     if args.tensorboard:
         config.setdefault("tensorboard", {})["enabled"] = True
         config["tensorboard"]["log_dir"] = args.tb_log_dir
 
     # Run attack
-    attacker = EmbeddingAttacker(model, config)
+    attacker = ImageAttacker(pipeline, config)
     attack_kwargs = build_attack_kwargs(args)
 
     results = attacker.run_attack(
         method=args.method,
-        embeddings=embeddings,
+        images=images,
         output_dir=args.output_dir,
+        filenames=filenames,
         **attack_kwargs,
     )
 
@@ -244,9 +206,11 @@ def main(argv: list[str] | None = None) -> None:
     if "avg_prob_reduction" in metrics:
         print(f"Avg probability reduction: {metrics['avg_prob_reduction']:.4f}")
     if "avg_l2_norm" in metrics:
-        print(f"Avg L2 norm:  {metrics['avg_l2_norm']:.6f}")
+        print(f"Avg L2 norm:    {metrics['avg_l2_norm']:.6f}")
     if "avg_linf_norm" in metrics:
         print(f"Avg L-inf norm: {metrics['avg_linf_norm']:.6f}")
+    if "avg_linf_norm_pixel" in metrics:
+        print(f"Avg L-inf (px): {metrics['avg_linf_norm_pixel']:.2f}/255")
     if "avg_iterations" in metrics:
         print(f"Avg iterations: {metrics['avg_iterations']:.1f}")
 

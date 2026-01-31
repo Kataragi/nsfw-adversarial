@@ -1,15 +1,14 @@
-"""Fast Gradient Sign Method (FGSM) attack implementation.
+"""FGSM (Fast Gradient Sign Method) attack on images.
 
-FGSM is a single-step gradient-based adversarial attack that perturbs
-inputs in the direction of the gradient of the loss with respect to
-the input, scaled by epsilon.
+Single-step gradient-based attack that perturbs each pixel by
+±ε in the direction that decreases the NSFW probability.
 
 Reference:
     Goodfellow et al., "Explaining and Harnessing Adversarial Examples", 2015
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import tensorflow as tf
@@ -23,119 +22,100 @@ class FGSMConfig:
     """Configuration for FGSM attack.
 
     Attributes:
-        epsilon: Maximum perturbation magnitude (L-inf norm).
-        targeted: Whether to perform targeted attack.
-        target_label: Target label for targeted attack (0.0 = SFW).
+        epsilon: L-inf perturbation budget in [0, 1] pixel scale.
+            Common values: 4/255, 8/255, 16/255.
+        targeted: If True, push prediction toward *target_label*.
+        target_label: Target label for the attack (0.0 = SFW).
         batch_size: Batch size for processing.
-        clip_min: Minimum value for clipping adversarial embeddings.
-        clip_max: Maximum value for clipping adversarial embeddings.
     """
 
-    epsilon: float = 0.05
+    epsilon: float = 8 / 255
     targeted: bool = True
     target_label: float = 0.0
-    batch_size: int = 256
-    clip_min: float | None = None
-    clip_max: float | None = None
+    batch_size: int = 8
 
 
 class FGSMAttack:
-    """Fast Gradient Sign Method attack.
-
-    Generates adversarial perturbations using a single gradient step
-    to cause misclassification of NSFW embeddings.
+    """FGSM attack on images through the end-to-end pipeline.
 
     Args:
-        model: Target classifier model.
+        pipeline: :class:`~src.pipeline.EndToEndModel` instance.
         config: FGSM configuration.
     """
 
-    def __init__(self, model: tf.keras.Model, config: FGSMConfig | None = None) -> None:
-        self.model = model
+    def __init__(
+        self,
+        pipeline: tf.keras.Model,
+        config: FGSMConfig | None = None,
+    ) -> None:
+        self.pipeline = pipeline
         self.config = config or FGSMConfig()
         self.loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=False)
 
     def _compute_gradient(
-        self, embeddings: tf.Tensor, target_labels: tf.Tensor
-    ) -> tf.Tensor:
-        """Compute gradient of loss with respect to input embeddings.
+        self, images: tf.Tensor, target_labels: tf.Tensor
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        """Compute loss gradient w.r.t. input images.
 
         Args:
-            embeddings: Input embeddings tensor.
-            target_labels: Target labels for the attack.
+            images: ``(N, H, W, 3)`` float32 in ``[0, 1]``.
+            target_labels: ``(N, 1)`` target labels.
 
         Returns:
-            Gradient tensor.
+            ``(loss, gradient)`` tensors.
         """
         with tf.GradientTape() as tape:
-            tape.watch(embeddings)
-            predictions = self.model(embeddings, training=False)
-            loss = self.loss_fn(target_labels, predictions)
+            tape.watch(images)
+            preds = self.pipeline(images, training=False)
+            loss = self.loss_fn(target_labels, preds)
 
-        gradient = tape.gradient(loss, embeddings)
-        return gradient
+        gradient = tape.gradient(loss, images)
+        return loss, gradient
 
-    def attack(self, embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Run FGSM attack on embeddings.
+    def attack(
+        self,
+        images: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run FGSM attack on a batch of images.
 
         Args:
-            embeddings: Original embeddings of shape (N, 256).
+            images: ``(N, H, W, 3)`` float32 in ``[0, 1]``.
 
         Returns:
-            Tuple of (adversarial_embeddings, noise) arrays.
+            ``(adversarial_images, noise)`` both ``(N, H, W, 3)``.
         """
-        n_samples = len(embeddings)
-        adversarial = np.copy(embeddings)
-        noise = np.zeros_like(embeddings)
-
-        target_val = self.config.target_label
-        batch_size = self.config.batch_size
-        epsilon = self.config.epsilon
+        cfg = self.config
+        n = len(images)
 
         logger.info(
-            "Running FGSM attack: epsilon=%.4f, samples=%d",
-            epsilon, n_samples,
+            "Running FGSM attack: ε=%.4f (%.1f/255), samples=%d",
+            cfg.epsilon, cfg.epsilon * 255, n,
         )
 
-        n_batches = (n_samples + batch_size - 1) // batch_size
+        all_adv = np.zeros_like(images)
+        all_noise = np.zeros_like(images)
+
+        n_batches = (n + cfg.batch_size - 1) // cfg.batch_size
 
         for i in tqdm(range(n_batches), desc="FGSM Attack", unit="batch"):
-            start = i * batch_size
-            end = min(start + batch_size, n_samples)
-            batch = tf.constant(embeddings[start:end], dtype=tf.float32)
-            targets = tf.fill([end - start, 1], target_val)
+            start = i * cfg.batch_size
+            end = min(start + cfg.batch_size, n)
+            batch = tf.constant(images[start:end], dtype=tf.float32)
+            targets = tf.fill([end - start, 1], cfg.target_label)
 
-            gradient = self._compute_gradient(batch, targets)
+            _, grad = self._compute_gradient(batch, targets)
 
-            # FGSM: perturb in the direction that minimizes loss toward target
-            if self.config.targeted:
-                perturbation = -epsilon * tf.sign(gradient)
+            # Targeted attack -> minimise loss -> subtract sign(grad)
+            if cfg.targeted:
+                perturbation = -cfg.epsilon * tf.sign(grad)
             else:
-                perturbation = epsilon * tf.sign(gradient)
+                perturbation = cfg.epsilon * tf.sign(grad)
 
-            adv_batch = batch + perturbation
+            adv = tf.clip_by_value(batch + perturbation, 0.0, 1.0)
+            noise = adv - batch
 
-            # Clip if bounds are specified
-            if self.config.clip_min is not None and self.config.clip_max is not None:
-                adv_batch = tf.clip_by_value(
-                    adv_batch, self.config.clip_min, self.config.clip_max
-                )
-
-            adversarial[start:end] = adv_batch.numpy()
-            noise[start:end] = (adv_batch - batch).numpy()
+            all_adv[start:end] = adv.numpy()
+            all_noise[start:end] = noise.numpy()
 
         logger.info("FGSM attack complete")
-        return adversarial, noise
-
-    def attack_single(self, embedding: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Run FGSM attack on a single embedding.
-
-        Args:
-            embedding: Single embedding of shape (256,).
-
-        Returns:
-            Tuple of (adversarial_embedding, noise).
-        """
-        emb = embedding.reshape(1, -1)
-        adv, n = self.attack(emb)
-        return adv.flatten(), n.flatten()
+        return all_adv, all_noise

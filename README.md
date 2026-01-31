@@ -1,24 +1,31 @@
 # NSFW Adversarial Noise Generator
 
-pNSFWMedia分類器に対する敵対的ノイズ生成システム。NSFW画像の埋め込みベクトルに摂動を加え、分類器をSFWと誤判定させます。
+pNSFWMedia分類器に対する**画像レベル**の敵対的ノイズ生成システム。NSFW画像に知覚困難な摂動を加え、分類器をSFWと誤判定させます。
 
 ## 概要
 
-NudeNet YOLOv8バックボーンから抽出された256次元埋め込みベクトルに対して、以下の4つの攻撃手法を実装しています:
+NudeNet YOLOv8バックボーンからpNSFWMedia分類器までの**エンドツーエンドパイプライン**を微分可能なTensorFlowモデルとして構築し、画像ピクセルに対する勾配を計算して敵対的ノイズを生成します。
+
+### パイプライン
+
+```
+画像 (320x320x3, [0,1])
+  -> NudeNet backbone (ONNX->TF変換)
+  -> Global Average Pooling
+  -> 直交射影 (C -> 256次元)
+  -> L2正規化
+  -> pNSFWMedia分類器
+  -> NSFW確率 (0.0~1.0)
+```
+
+### 攻撃手法
 
 | 攻撃手法 | 種別 | 特徴 |
 |---------|------|------|
 | **FGSM** | 単一ステップ勾配攻撃 | 高速、ε1パラメータで制御 |
 | **PGD** | 反復勾配攻撃 | FGSMの反復版、高い成功率 |
-| **C&W** | 最適化ベース攻撃 | 最小摂動を探索、高品質 |
+| **C&W** | 最適化ベース攻撃 | 最小L2摂動を探索 |
 | **DeepFool** | 最小摂動攻撃 | 決定境界への最短距離を計算 |
-
-## ターゲット分類器
-
-- **リポジトリ**: [pNSFWMedia](https://github.com/Kataragi/pNSFWMedia)
-- **入力**: 256次元埋め込みベクトル
-- **構造**: BatchNorm → Dense(256, tanh) → Dense(1, sigmoid)
-- **出力**: NSFW確率 (≥0.5でNSFW判定)
 
 ## セットアップ
 
@@ -26,6 +33,7 @@ NudeNet YOLOv8バックボーンから抽出された256次元埋め込みベク
 
 - Python 3.10+
 - TensorFlow 2.16.1+
+- ONNX Runtime
 - CUDA対応GPU (推奨、CPUでも動作可)
 
 ### インストール
@@ -36,26 +44,37 @@ cd nsfw-adversarial
 pip install -r requirements.txt
 ```
 
-### ターゲットモデルの配置
+### 必要ファイルの配置
 
-pNSFWMediaの学習済みモデルを配置します:
+#### 1. pNSFWMedia分類器
 
 ```bash
-# 方法1: ファイルを直接コピー
+# 方法1: 直接コピー
 cp /path/to/pNSFWMedia/models/pnsfwmedia_classifier.keras models/target_classifier/
 
 # 方法2: gitサブモジュール
 git submodule add https://github.com/Kataragi/pNSFWMedia.git models/pNSFWMedia
-ln -s models/pNSFWMedia/models/pnsfwmedia_classifier.keras models/target_classifier/
+cp models/pNSFWMedia/models/pnsfwmedia_classifier.keras models/target_classifier/
 ```
 
-### 埋め込みデータの準備
+#### 2. 射影行列
 
-NudeNetで抽出した埋め込みベクトル(.npy形式)を配置:
+pNSFWMediaの埋め込み抽出時に生成される射影行列を配置:
 
 ```bash
-mkdir -p dataset/nsfw_embeddings
-# .npy ファイルを dataset/nsfw_embeddings/ に配置
+cp /path/to/pNSFWMedia/models/nudenet_projection.npy models/
+```
+
+#### 3. NudeNet ONNXモデル
+
+`pip install nudenet` でインストールすると自動的に `best.onnx` が配置されます。
+初回実行時にONNXバックボーンがTensorFlow形式に自動変換され、`models/tf_backbone/` にキャッシュされます。
+
+#### 4. 攻撃対象画像
+
+```bash
+mkdir -p dataset/nsfw_images
+# NSFW画像を配置 (.jpg, .png, .webp 等)
 ```
 
 ## 使い方
@@ -65,10 +84,9 @@ mkdir -p dataset/nsfw_embeddings
 ```bash
 python src/noise_generator.py \
     --method fgsm \
-    --target-model models/target_classifier/pnsfwmedia_classifier.keras \
-    --embeddings-dir dataset/nsfw_embeddings \
-    --epsilon 0.05 \
-    --output-dir experiments/attack_results/fgsm_eps0.05
+    --images-dir dataset/nsfw_images \
+    --epsilon 0.031 \
+    --output-dir experiments/attack_results/fgsm_8px
 ```
 
 ### PGD攻撃
@@ -76,12 +94,11 @@ python src/noise_generator.py \
 ```bash
 python src/noise_generator.py \
     --method pgd \
-    --target-model models/target_classifier/pnsfwmedia_classifier.keras \
-    --embeddings-dir dataset/nsfw_embeddings \
-    --epsilon 0.05 \
-    --alpha 0.01 \
+    --images-dir dataset/nsfw_images \
+    --epsilon 0.031 \
+    --alpha 0.008 \
     --iterations 20 \
-    --output-dir experiments/attack_results/pgd_eps0.05
+    --output-dir experiments/attack_results/pgd_8px
 ```
 
 ### C&W攻撃
@@ -89,8 +106,7 @@ python src/noise_generator.py \
 ```bash
 python src/noise_generator.py \
     --method cw \
-    --target-model models/target_classifier/pnsfwmedia_classifier.keras \
-    --embeddings-dir dataset/nsfw_embeddings \
+    --images-dir dataset/nsfw_images \
     --cw-c 1.0 \
     --cw-kappa 0.0 \
     --iterations 500 \
@@ -102,8 +118,7 @@ python src/noise_generator.py \
 ```bash
 python src/noise_generator.py \
     --method deepfool \
-    --target-model models/target_classifier/pnsfwmedia_classifier.keras \
-    --embeddings-dir dataset/nsfw_embeddings \
+    --images-dir dataset/nsfw_images \
     --max-iterations 100 \
     --overshoot 0.02 \
     --output-dir experiments/attack_results/deepfool
@@ -111,31 +126,24 @@ python src/noise_generator.py \
 
 ### 一括ロバスト性評価
 
-複数手法・パラメータで一括評価し、可視化を生成:
-
 ```bash
 python src/evaluate_robustness.py \
-    --target-model models/target_classifier/pnsfwmedia_classifier.keras \
-    --embeddings-dir dataset/nsfw_embeddings \
+    --images-dir dataset/nsfw_images \
     --methods fgsm pgd cw deepfool \
-    --epsilon-range 0.01 0.05 0.1 \
+    --epsilon-range 0.016 0.031 0.063 0.125 \
     --output-dir experiments/robustness_analysis
 ```
 
 ### TensorBoardによるモニタリング
 
-攻撃の進行状況をTensorBoardで確認できます:
-
 ```bash
-# TensorBoardを有効にして攻撃を実行
+# TensorBoardを有効にして攻撃実行
 python src/noise_generator.py \
     --method pgd \
-    --target-model models/target_classifier/pnsfwmedia_classifier.keras \
-    --embeddings-dir dataset/nsfw_embeddings \
-    --tensorboard \
-    --tb-log-dir logs
+    --images-dir dataset/nsfw_images \
+    --tensorboard --tb-log-dir logs
 
-# 別ターミナルでTensorBoardを起動
+# 別ターミナルでTensorBoard起動
 tensorboard --logdir logs
 ```
 
@@ -144,27 +152,44 @@ tensorboard --logdir logs
 - 損失関数の推移
 - 攻撃成功率の推移
 
+### パイプラインオプション
+
+すべてのコマンドで以下のオプションが使用可能:
+
+```bash
+--classifier-model PATH   # 分類器モデルパス
+--projection-path PATH    # 射影行列パス
+--nudenet-onnx PATH       # NudeNet ONNXパス (未指定時は自動検出)
+--backbone-cache DIR      # TFバックボーンのキャッシュディレクトリ
+--max-images N            # 処理する画像数の上限
+```
+
 ## 出力形式
 
-各攻撃の結果はJSON形式で保存されます:
+### JSON結果
 
 ```json
 {
     "attack_method": "PGD",
-    "parameters": {"epsilon": 0.05, "alpha": 0.01, "iterations": 20},
+    "parameters": {"epsilon": 0.031, "alpha": 0.008, "iterations": 20},
     "results": {
-        "total_samples": 1000,
-        "nsfw_samples": 800,
+        "total_samples": 100,
+        "nsfw_samples": 95,
         "success_rate_0.5": 0.92,
         "success_rate_0.4": 0.87,
         "success_rate_0.3": 0.75,
         "avg_prob_reduction": 0.45,
-        "avg_l2_norm": 0.023,
-        "avg_linf_norm": 0.048,
+        "avg_l2_norm": 2.34,
+        "avg_linf_norm": 0.031,
+        "avg_linf_norm_pixel": 8.0,
         "avg_iterations": 18.3
     }
 }
 ```
+
+### 敵対的画像
+
+攻撃成功した画像は `output_dir/images/` にPNG形式で保存されます。
 
 ### 評価メトリクス
 
@@ -175,72 +200,61 @@ tensorboard --logdir logs
 | `success_rate_0.3` | NSFW確率が0.3未満に低下した割合 |
 | `avg_prob_reduction` | 攻撃前後の平均確率低下量 |
 | `avg_l2_norm` | 摂動のL2ノルム平均 |
-| `avg_linf_norm` | 摂動のL∞ノルム平均 |
+| `avg_linf_norm` | 摂動のL-inf ノルム平均 ([0,1]スケール) |
+| `avg_linf_norm_pixel` | 摂動のL-inf ノルム平均 ([0,255]スケール) |
 | `avg_iterations` | 反復攻撃の平均収束回数 |
-
-### 生成される可視化
-
-`evaluate_robustness.py`は以下の可視化を生成します:
-
-- **epsilon_vs_success_rate.png** - ε値と攻撃成功率の関係
-- **probability_distributions.png** - 攻撃前後のNSFW確率分布
-- **noise_distributions.png** - 摂動ノルムの分布
-- **comparison_table.png** - 全手法の比較サマリー
 
 ## プロジェクト構成
 
 ```
 nsfw-adversarial/
-├── README.md                     # このファイル
-├── requirements.txt              # 依存パッケージ
-├── .gitignore                    # Git除外設定
+├── README.md
+├── requirements.txt
+├── .gitignore
 ├── config/
 │   └── attack_config.yaml       # 攻撃パラメータ設定
 ├── src/
 │   ├── __init__.py
+│   ├── pipeline.py              # エンドツーエンドパイプライン (ONNX->TF変換)
 │   ├── attacks/
 │   │   ├── __init__.py
-│   │   ├── fgsm.py              # FGSM攻撃
-│   │   ├── pgd.py               # PGD攻撃
-│   │   ├── cw.py                # C&W攻撃
-│   │   └── deepfool.py          # DeepFool攻撃
+│   │   ├── fgsm.py              # FGSM攻撃 (画像)
+│   │   ├── pgd.py               # PGD攻撃 (画像)
+│   │   ├── cw.py                # C&W攻撃 (画像)
+│   │   └── deepfool.py          # DeepFool攻撃 (画像)
+│   ├── image_attacker.py        # 攻撃オーケストレーション
 │   ├── noise_generator.py       # CLI メインスクリプト
-│   ├── embedding_attacker.py    # 攻撃オーケストレーション
 │   ├── evaluate_robustness.py   # ロバスト性評価・可視化
-│   └── utils.py                 # ユーティリティ関数
+│   └── utils.py                 # ユーティリティ (画像I/O、メトリクス)
 ├── models/
-│   └── target_classifier/       # ターゲットモデル配置先
+│   ├── target_classifier/       # pNSFWMedia分類器
+│   └── tf_backbone/             # NudeNetバックボーン (自動生成)
 ├── experiments/
-│   ├── attack_results/          # 攻撃結果出力
-│   └── visualizations/          # 可視化出力
+│   ├── attack_results/
+│   └── visualizations/
 └── notebooks/
-    └── attack_demo.ipynb        # デモノートブック
-```
-
-## 設定ファイル
-
-`config/attack_config.yaml`でデフォルトパラメータを管理:
-
-```yaml
-attacks:
-  fgsm:
-    epsilon: [0.01, 0.03, 0.05, 0.07, 0.1]
-  pgd:
-    epsilon: [0.01, 0.03, 0.05, 0.07, 0.1]
-    alpha: [0.001, 0.005, 0.01]
-    iterations: [10, 20, 40]
+    └── attack_demo.ipynb
 ```
 
 ## パラメータチューニングガイド
 
-高い攻撃成功率(95%以上)を得るための推奨設定:
+εの単位は[0,1]ピクセルスケール。x/255で指定:
 
 | 手法 | 推奨パラメータ |
 |------|--------------|
-| FGSM | ε = 0.07〜0.1 |
-| PGD  | ε = 0.05, α = ε/4, iterations = 20〜40 |
-| C&W  | c = 1.0〜10.0, iterations = 500+ |
-| DeepFool | overshoot = 0.02〜0.05 |
+| FGSM | ε = 8~16/255 |
+| PGD  | ε = 8/255, α = ε/4, iterations = 20~40 |
+| C&W  | c = 1.0~10.0, iterations = 500+ |
+| DeepFool | overshoot = 0.02~0.05 |
+
+## 初回実行時の動作
+
+1. NudeNet ONNXモデルを自動検出
+2. バックボーン部分をONNXから抽出
+3. `onnx2tf` でTensorFlow SavedModelに変換
+4. `models/tf_backbone/` にキャッシュ (2回目以降は高速起動)
+5. パイプライン全体をTFモデルとして構築
+6. 指定された攻撃を実行
 
 ## ライセンス
 

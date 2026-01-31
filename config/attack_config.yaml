@@ -1,26 +1,28 @@
-# Adversarial Attack Configuration
+# Adversarial Attack Configuration (image-based)
 
-# Target classifier settings
-target_model:
-  path: "models/target_classifier/pnsfwmedia_classifier.keras"
-  input_dim: 256
+# Pipeline settings
+pipeline:
+  classifier_path: "models/target_classifier/pnsfwmedia_classifier.keras"
+  projection_path: "models/nudenet_projection.npy"
+  backbone_cache_dir: "models/tf_backbone"
+  image_size: 320
   threshold: 0.5
 
-# Embedding settings
-embeddings:
-  dir: "dataset/nsfw_embeddings"
-  dim: 256
+# Image settings
+images:
+  dir: "dataset/nsfw_images"
+  extensions: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
 
-# Attack methods
+# Attack methods (epsilon in pixel-scale [0,1]; 8/255 ≈ 0.031)
 attacks:
   fgsm:
-    epsilon: [0.01, 0.03, 0.05, 0.07, 0.1]
+    epsilon: [0.0157, 0.0314, 0.0627, 0.1255]  # 4, 8, 16, 32 /255
     targeted: true
     target_label: 0.0
 
   pgd:
-    epsilon: [0.01, 0.03, 0.05, 0.07, 0.1]
-    alpha: [0.001, 0.005, 0.01]
+    epsilon: [0.0157, 0.0314, 0.0627, 0.1255]
+    alpha_ratio: 0.25    # alpha = epsilon * alpha_ratio
     iterations: [10, 20, 40]
     random_start: true
     targeted: true
@@ -40,15 +42,15 @@ attacks:
 # Evaluation settings
 evaluation:
   thresholds: [0.3, 0.4, 0.5]
-  batch_size: 256
+  batch_size: 8
   seed: 42
 
 # Output settings
 output:
   results_dir: "experiments/attack_results"
   visualizations_dir: "experiments/visualizations"
-  save_adversarial_embeddings: true
-  save_noise: true
+  save_adversarial_images: true
+  save_noise_images: false
 
 # TensorBoard settings
 tensorboard:

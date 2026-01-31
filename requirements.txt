@@ -1,5 +1,10 @@
 tensorflow>=2.16.1
 numpy>=1.26.4
+onnx>=1.14.0
+onnx2tf>=1.17.0
+onnxruntime>=1.16.0
+opencv-python>=4.8.0
+nudenet>=3.4.0
 matplotlib>=3.8.0
 seaborn>=0.13.0
 pyyaml>=6.0.1

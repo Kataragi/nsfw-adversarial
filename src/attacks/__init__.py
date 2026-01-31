@@ -1,4 +1,4 @@
-"""Adversarial attack implementations."""
+"""Adversarial attack implementations (image-based)."""
 
 from src.attacks.fgsm import FGSMAttack
 from src.attacks.pgd import PGDAttack

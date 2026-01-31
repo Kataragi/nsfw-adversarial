@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data & Models
+dataset/
+models/target_classifier/*.keras
+models/target_classifier/*.h5
+*.npy
+*.npz
+
+# Experiment outputs
+experiments/attack_results/
+experiments/visualizations/
+
+# TensorBoard
+logs/
+runs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env

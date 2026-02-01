@@ -312,31 +312,70 @@ def _load_keras_classifier_weights(
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Keras分類器からDense層の重みとバイアスを抽出する。
 
+    .keras ファイル（ZIP アーカイブ）内の model.weights.h5 を
+    h5py で直接読み込み、TensorFlow に依存せずに重みを取得する。
+
     Args:
         classifier_path: .keras ファイルのパス。
 
     Returns:
         [(weight, bias), ...] のリスト。各weightは (in, out) 形状。
     """
-    # TensorFlowのインポートはここでのみ必要
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-    import tensorflow as tf
+    import tempfile
+    import zipfile
 
-    tf.get_logger().setLevel("ERROR")
+    import h5py
 
-    classifier = tf.keras.models.load_model(classifier_path)
-    layers = []
-
-    for layer in classifier.layers:
-        if isinstance(layer, tf.keras.layers.Dense):
-            w, b = layer.get_weights()
-            layers.append((w, b))
-            logger.info(
-                "  Dense層を抽出: 入力=%d, 出力=%d, 活性化=%s",
-                w.shape[0],
-                w.shape[1],
-                layer.get_config().get("activation", "none"),
+    # .keras ファイルは ZIP アーカイブ。中の model.weights.h5 を抽出する
+    with zipfile.ZipFile(classifier_path, "r") as zf:
+        names = zf.namelist()
+        # weights ファイルを探す
+        weight_file = None
+        for name in names:
+            if name.endswith(".h5"):
+                weight_file = name
+                break
+        if weight_file is None:
+            raise ValueError(
+                f"{classifier_path} 内に .h5 ウェイトファイルが見つかりません。"
+                f" 含まれるファイル: {names}"
             )
+
+        # 一時ファイルに展開して h5py で読み込む
+        with tempfile.TemporaryDirectory() as tmpdir:
+            extracted = zf.extract(weight_file, tmpdir)
+
+            layers: list[tuple[np.ndarray, np.ndarray]] = []
+            with h5py.File(extracted, "r") as f:
+                # HDF5 構造を再帰探索し kernel:0 / bias:0 のペアを収集
+                dense_groups: list[h5py.Group] = []
+
+                def _find_dense_groups(group: h5py.Group) -> None:
+                    """kernel:0 と bias:0 の両方を持つグループを探す。"""
+                    has_kernel = any("kernel" in k for k in group.keys())
+                    has_bias = any("bias" in k for k in group.keys())
+                    if has_kernel and has_bias:
+                        dense_groups.append(group)
+                        return
+                    for key in group.keys():
+                        item = group[key]
+                        if isinstance(item, h5py.Group):
+                            _find_dense_groups(item)
+
+                _find_dense_groups(f)
+
+                for grp in dense_groups:
+                    # kernel:0 と bias:0 を取得
+                    kernel_key = [k for k in grp.keys() if "kernel" in k][0]
+                    bias_key = [k for k in grp.keys() if "bias" in k][0]
+                    w = np.array(grp[kernel_key], dtype=np.float32)  # (in, out)
+                    b = np.array(grp[bias_key], dtype=np.float32)    # (out,)
+                    layers.append((w, b))
+                    logger.info(
+                        "  Dense層を抽出: 入力=%d, 出力=%d",
+                        w.shape[0],
+                        w.shape[1],
+                    )
 
     if not layers:
         raise ValueError(

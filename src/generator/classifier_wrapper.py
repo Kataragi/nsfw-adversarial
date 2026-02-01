@@ -41,13 +41,24 @@ IMAGE_SIZE = 320
 
 
 def find_nudenet_onnx() -> str:
-    """NudeNet ONNXモデルファイルの場所を特定する。"""
+    """NudeNet ONNXモデルファイルの場所を特定する。
+
+    nudenet パッケージ内の .onnx ファイルを動的に検出する。
+    best.onnx があればそちらを優先し、なければ見つかったものを使用する。
+    これにより nudenet のバージョンでファイル名が変わっても動作する。
+    """
     try:
         import nudenet
 
-        model_path = Path(nudenet.__file__).parent / "best.onnx"
-        if model_path.exists():
-            return str(model_path)
+        nudenet_dir = Path(nudenet.__file__).parent
+        # パッケージ内の .onnx を全て収集し、best.onnx があればそちらを優先
+        onnx_files = sorted(nudenet_dir.glob("*.onnx"))
+        if onnx_files:
+            for f in onnx_files:
+                if f.name == "best.onnx":
+                    return str(f)
+            # best.onnx がなければ最初に見つかったものを使用
+            return str(onnx_files[0])
     except ImportError:
         pass
 

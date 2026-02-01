@@ -40,10 +40,11 @@ IMAGE_SIZE = 320
 def find_nudenet_onnx() -> str:
     """Locate the NudeNet ONNX model file.
 
-    Searches the ``nudenet`` package directory and common fallback paths.
+    Searches the ``nudenet`` package directory for any ``.onnx`` file,
+    then falls back to common paths.
 
     Returns:
-        Absolute path to ``best.onnx``.
+        Absolute path to the ONNX model.
 
     Raises:
         FileNotFoundError: If the model cannot be found.
@@ -51,9 +52,15 @@ def find_nudenet_onnx() -> str:
     try:
         import nudenet
 
-        model_path = Path(nudenet.__file__).parent / "best.onnx"
-        if model_path.exists():
-            return str(model_path)
+        nudenet_dir = Path(nudenet.__file__).parent
+        # パッケージ内の .onnx を全て収集し、best.onnx があればそちらを優先
+        onnx_files = sorted(nudenet_dir.glob("*.onnx"))
+        if onnx_files:
+            for f in onnx_files:
+                if f.name == "best.onnx":
+                    return str(f)
+            # best.onnx がなければ最初に見つかったものを使用
+            return str(onnx_files[0])
     except ImportError:
         pass
 

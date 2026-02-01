@@ -1,17 +1,35 @@
-tensorflow>=2.16.1
-numpy>=1.26.4
+# WSL2 (Ubuntu) + CUDA 環境向け依存パッケージ
+# PyTorch CUDA wheels の取得先
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# ── ディープラーニングフレームワーク ──
+tensorflow[and-cuda]>=2.16.1
+torch>=2.2.0
+torchvision>=0.17.0
+
+# ── ONNX ──
 onnx>=1.14.0
 onnx2tf>=1.17.0
 onnx2torch>=1.5.0
-onnxruntime>=1.16.0
-opencv-python>=4.8.0
+onnxruntime-gpu>=1.16.0
+
+# ── 画像処理 ──
+# headless 版: WSL2 で libGL / X11 が不要
+opencv-python-headless>=4.8.0
+
+# ── NSFW分類器バックボーン ──
 nudenet>=3.4.0
+
+# ── 数値計算・可視化 ──
+numpy>=1.26.4
 matplotlib>=3.8.0
 seaborn>=0.13.0
+scikit-learn>=1.4.0
+
+# ── ユーティリティ ──
 pyyaml>=6.0.1
 tqdm>=4.66.0
 tensorboard>=2.16.0
-torch>=2.2.0
-torchvision>=0.17.0
+
+# ── テスト ──
 pytest>=8.0.0
-scikit-learn>=1.4.0

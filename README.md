@@ -31,18 +31,37 @@ NudeNet YOLOv8バックボーンからpNSFWMedia分類器までの**エンドツ
 
 ### 必要環境
 
+- WSL2 (Ubuntu 22.04+)
 - Python 3.10+
-- TensorFlow 2.16.1+
-- ONNX Runtime
-- CUDA対応GPU (推奨、CPUでも動作可)
+- NVIDIA GPU + CUDA Toolkit 12.4+
+- TensorFlow 2.16.1+ / PyTorch 2.2+
+- ONNX Runtime GPU
+
+### WSL2 前提のシステム依存パッケージ
+
+```bash
+# WSL2 Ubuntu で必要な最小限のパッケージ
+sudo apt update && sudo apt install -y \
+    python3-dev python3-pip python3-venv \
+    libglib2.0-0 libsm6 libxrender1 libxext6
+
+# NVIDIA ドライバはWindows側にインストール済みであること
+# WSL2 内では CUDA Toolkit のみ必要
+# https://developer.nvidia.com/cuda-downloads (WSL-Ubuntu を選択)
+nvidia-smi  # GPU が認識されていることを確認
+```
 
 ### インストール
 
 ```bash
 git clone https://github.com/Kataragi/nsfw-adversarial.git
 cd nsfw-adversarial
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+> **注意**: `requirements.txt` は `--extra-index-url` で PyTorch CUDA 12.4 wheels を参照しています。
+> 異なる CUDA バージョンを使用する場合は `cu124` 部分を `cu121` 等に書き換えてください。
 
 ### 必要ファイルの配置
 

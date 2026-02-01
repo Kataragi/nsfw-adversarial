@@ -76,22 +76,46 @@ def find_nudenet_onnx() -> str:
 
 
 def _find_backbone_node(onnx_model) -> str:
-    """YOLOv8 ONNXモデルからバックボーンの特徴ノードを探す。"""
+    """YOLOv8 ONNXモデルからバックボーンの特徴ノードを探す。
+
+    ヒューリスティック:
+        1. 優先: SPPF ブロックの出力 (MaxPool->Concat パターン)
+        2. フォールバック: 最初の Conv->Concat 境界
+        3. 最終: 最後の Conv 出力
+
+    FPN/Neck 内部のノードを誤選択しないよう、最初の境界を使用する。
+    """
+    # --- 1. 優先: SPPF ブロックの出力を探す ---
+    for node in onnx_model.graph.node:
+        if node.op_type == "Concat":
+            input_ops = set()
+            for inp in node.input:
+                for n2 in onnx_model.graph.node:
+                    if n2.output and n2.output[0] == inp:
+                        input_ops.add(n2.op_type)
+            if "MaxPool" in input_ops and node.output:
+                concat_out = node.output[0]
+                for n2 in onnx_model.graph.node:
+                    if n2.op_type == "Conv" and concat_out in n2.input and n2.output:
+                        logger.info("SPPF 後の Conv ノードを検出: %s", n2.output[0])
+                        return n2.output[0]
+                logger.info("SPPF Concat ノードを検出: %s", concat_out)
+                return concat_out
+
+    # --- 2. フォールバック: 最初の Conv->Concat 境界 ---
     consumers: dict[str, list[str]] = {}
     for node in onnx_model.graph.node:
         for inp in node.input:
             consumers.setdefault(inp, []).append(node.op_type)
 
-    candidates = []
     for node in onnx_model.graph.node:
         if node.op_type == "Conv" and node.output:
             out = node.output[0]
             if out in consumers and "Concat" in consumers[out]:
-                candidates.append(out)
+                logger.info("Conv->Concat 境界ノードを検出: %s", out)
+                return out
 
-    if candidates:
-        return candidates[-1]
-
+    # --- 3. 最終フォールバック: 最後の Conv 出力 ---
     for node in reversed(onnx_model.graph.node):
         if node.op_type == "Conv" and node.output:
             return node.output[0]
@@ -120,27 +144,27 @@ def _extract_backbone_onnx(onnx_path: str, output_path: str) -> str:
     return output_path
 
 
-def _get_backbone_feature_dim(onnx_path: str, node_name: str) -> tuple[int, ...]:
-    """ダミー入力でバックボーンの出力形状を取得する。"""
-    import onnx
+def _get_backbone_feature_dim_from_extracted(
+    backbone_onnx_path: str,
+) -> tuple[int, ...]:
+    """抽出済みバックボーンONNXからダミー推論で出力形状を取得する。
+
+    フルモデル上で中間ノードを取得する方式だと FPN の Concat ノードで
+    形状不一致エラーが発生するため、先に抽出したサブグラフを使用する。
+    """
     import onnxruntime as ort
 
-    model = onnx.load(onnx_path)
-    intermediate = onnx.helper.make_tensor_value_info(
-        node_name, onnx.TensorProto.FLOAT, None
-    )
-    model.graph.output.append(intermediate)
-    modified_bytes = model.SerializeToString()
-
     sess = ort.InferenceSession(
-        modified_bytes, providers=["CPUExecutionProvider"]
+        backbone_onnx_path, providers=["CPUExecutionProvider"]
     )
     input_info = sess.get_inputs()[0]
+    output_info = sess.get_outputs()[0]
+
     h = input_info.shape[2] if isinstance(input_info.shape[2], int) else IMAGE_SIZE
     w = input_info.shape[3] if isinstance(input_info.shape[3], int) else IMAGE_SIZE
     dummy = np.zeros((1, 3, h, w), dtype=np.float32)
 
-    out = sess.run([node_name], {input_info.name: dummy})[0]
+    out = sess.run([output_info.name], {input_info.name: dummy})[0]
     return out.shape  # (1, C, H, W)
 
 
@@ -247,20 +271,18 @@ def convert_backbone_to_pytorch(
     if nudenet_onnx_path is None:
         nudenet_onnx_path = find_nudenet_onnx()
 
-    # バックボーンノードと特徴次元を取得
-    onnx_model = onnx.load(nudenet_onnx_path)
-    backbone_node = _find_backbone_node(onnx_model)
-    feat_shape = _get_backbone_feature_dim(nudenet_onnx_path, backbone_node)
+    # 1. バックボーンONNXを先に抽出（フルモデル推論の Concat エラーを回避）
+    backbone_onnx = os.path.join(cache_dir, "backbone.onnx")
+    _extract_backbone_onnx(nudenet_onnx_path, backbone_onnx)
+
+    # 2. 抽出済みバックボーンから特徴次元を取得
+    feat_shape = _get_backbone_feature_dim_from_extracted(backbone_onnx)
     feature_channels = int(feat_shape[1])
     logger.info(
         "バックボーン特徴形状 (NCHW): %s  チャネル数=%d",
         feat_shape,
         feature_channels,
     )
-
-    # バックボーンONNXを抽出
-    backbone_onnx = os.path.join(cache_dir, "backbone.onnx")
-    _extract_backbone_onnx(nudenet_onnx_path, backbone_onnx)
 
     # ONNX -> PyTorch変換
     logger.info("バックボーンONNX -> PyTorch変換中 ...")
@@ -270,6 +292,8 @@ def convert_backbone_to_pytorch(
 
     # キャッシュに保存
     torch.save(backbone, pt_path)
+    onnx_full = onnx.load(nudenet_onnx_path)
+    backbone_node = _find_backbone_node(onnx_full)
     meta = {
         "backbone_node": backbone_node,
         "feature_channels": feature_channels,

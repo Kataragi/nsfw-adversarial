@@ -80,25 +80,49 @@ def find_nudenet_onnx() -> str:
 def _find_backbone_node(onnx_model: onnx.ModelProto) -> str:
     """Find the backbone feature node in a YOLOv8 ONNX model.
 
-    Heuristic: the last Conv output that feeds into a Concat node
-    (backbone-FPN boundary).
+    Heuristic: look for the SPPF output (MaxPool -> Concat pattern unique
+    to the SPPF block at the end of the YOLOv8 backbone).  If that fails,
+    fall back to the *first* Conv output that feeds a Concat – which is
+    the deepest backbone feature at the backbone-FPN boundary.
+
+    Using the first Conv->Concat candidate avoids accidentally selecting
+    nodes inside the FPN/neck that have shape mismatches.
     """
+    # --- 1. 優先: SPPF ブロックの出力を探す ---
+    # SPPF は MaxPool -> Concat パターン。Concat の出力がバックボーン最終特徴。
+    for node in onnx_model.graph.node:
+        if node.op_type == "Concat":
+            # Concat の入力がすべて MaxPool (SPPF 構造) か確認
+            input_ops = set()
+            for inp in node.input:
+                for n2 in onnx_model.graph.node:
+                    if n2.output and n2.output[0] == inp:
+                        input_ops.add(n2.op_type)
+            if "MaxPool" in input_ops and node.output:
+                # この Concat の出力を通す次の Conv を探す
+                concat_out = node.output[0]
+                for n2 in onnx_model.graph.node:
+                    if n2.op_type == "Conv" and concat_out in n2.input and n2.output:
+                        logger.info("SPPF 後の Conv ノードを検出: %s", n2.output[0])
+                        return n2.output[0]
+                # Conv が見つからなければ Concat 出力自体を使用
+                logger.info("SPPF Concat ノードを検出: %s", concat_out)
+                return concat_out
+
+    # --- 2. フォールバック: 最初の Conv->Concat 境界 ---
     consumers: dict[str, list[str]] = {}
     for node in onnx_model.graph.node:
         for inp in node.input:
             consumers.setdefault(inp, []).append(node.op_type)
 
-    candidates = []
     for node in onnx_model.graph.node:
         if node.op_type == "Conv" and node.output:
             out = node.output[0]
             if out in consumers and "Concat" in consumers[out]:
-                candidates.append(out)
+                logger.info("Conv->Concat 境界ノードを検出: %s", out)
+                return out
 
-    if candidates:
-        return candidates[-1]
-
-    # Fallback: last Conv output
+    # --- 3. 最終フォールバック: 最後の Conv 出力 ---
     for node in reversed(onnx_model.graph.node):
         if node.op_type == "Conv" and node.output:
             return node.output[0]
@@ -106,28 +130,28 @@ def _find_backbone_node(onnx_model: onnx.ModelProto) -> str:
     raise RuntimeError("Could not find backbone feature node in ONNX model")
 
 
-def _get_backbone_feature_dim(onnx_path: str, node_name: str) -> tuple[int, ...]:
-    """Run a dummy forward pass to discover the backbone output shape."""
+def _get_backbone_feature_dim_from_extracted(
+    backbone_onnx_path: str,
+) -> tuple[int, ...]:
+    """Run a dummy forward pass on the *extracted* backbone ONNX to get
+    the output shape.
+
+    Unlike the previous approach that ran the full NudeNet model (which
+    could fail at FPN Concat nodes), this runs only the backbone sub-graph.
+    """
     import onnxruntime as ort
 
-    model = onnx.load(onnx_path)
-
-    # Temporarily add the intermediate node as an output
-    intermediate = onnx.helper.make_tensor_value_info(
-        node_name, onnx.TensorProto.FLOAT, None
-    )
-    model.graph.output.append(intermediate)
-    modified_bytes = model.SerializeToString()
-
     sess = ort.InferenceSession(
-        modified_bytes, providers=["CPUExecutionProvider"]
+        backbone_onnx_path, providers=["CPUExecutionProvider"]
     )
     input_info = sess.get_inputs()[0]
+    output_info = sess.get_outputs()[0]
+
     h = input_info.shape[2] if isinstance(input_info.shape[2], int) else IMAGE_SIZE
     w = input_info.shape[3] if isinstance(input_info.shape[3], int) else IMAGE_SIZE
     dummy = np.zeros((1, 3, h, w), dtype=np.float32)
 
-    out = sess.run([node_name], {input_info.name: dummy})[0]
+    out = sess.run([output_info.name], {input_info.name: dummy})[0]
     return out.shape  # (1, C, H, W)
 
 
@@ -153,12 +177,82 @@ def _extract_backbone_onnx(onnx_path: str, output_path: str) -> str:
     return output_path
 
 
+def _sanitize_onnx_names(onnx_path: str) -> None:
+    """Sanitize ONNX node/output names so they comply with TF naming rules.
+
+    TensorFlow SavedModel requires names matching ``^[A-Za-z0-9.][A-Za-z0-9_./>-]*$``.
+    NudeNet ONNX models contain names like ``/model.22/cv3.2/Conv_output_0/``
+    which have leading/trailing slashes.  This function rewrites names in-place.
+    """
+    import re
+
+    model = onnx.load(onnx_path)
+    _TF_NAME_RE = re.compile(r"^[A-Za-z0-9.][A-Za-z0-9_./>-]*$")
+
+    def _clean(name: str) -> str:
+        if not name or _TF_NAME_RE.match(name):
+            return name
+        # 先頭・末尾のスラッシュを除去し、残ったスラッシュをドットに変換
+        cleaned = name.strip("/").replace("/", ".")
+        # 先頭が不正な文字の場合にプレフィックスを付与
+        if cleaned and not re.match(r"^[A-Za-z0-9.]", cleaned):
+            cleaned = "n." + cleaned
+        return cleaned or "unnamed"
+
+    # 名前のマッピングテーブルを構築
+    rename_map: dict[str, str] = {}
+
+    for node in model.graph.node:
+        if node.name:
+            new_name = _clean(node.name)
+            if new_name != node.name:
+                rename_map[node.name] = new_name
+                node.name = new_name
+        for i, out in enumerate(node.output):
+            new_out = _clean(out)
+            if new_out != out:
+                rename_map[out] = new_out
+                node.output[i] = new_out
+        for i, inp in enumerate(node.input):
+            if inp in rename_map:
+                node.input[i] = rename_map[inp]
+
+    # グラフの入出力名も更新
+    for io in list(model.graph.input) + list(model.graph.output):
+        if io.name in rename_map:
+            io.name = rename_map[io.name]
+
+    # initializer 名も更新
+    for init in model.graph.initializer:
+        if init.name in rename_map:
+            init.name = rename_map[init.name]
+
+    # value_info 名も更新
+    for vi in model.graph.value_info:
+        if vi.name in rename_map:
+            vi.name = rename_map[vi.name]
+
+    if rename_map:
+        logger.info(
+            "Sanitized %d ONNX names for TF compatibility", len(rename_map)
+        )
+
+    onnx.save(model, onnx_path)
+
+
 def convert_backbone(
     nudenet_onnx_path: str | None = None,
     cache_dir: str = "models/tf_backbone",
     force: bool = False,
 ) -> str:
     """Convert NudeNet ONNX backbone to a TF SavedModel (cached).
+
+    Steps:
+        1. Find the backbone feature node (SPPF output or Conv->Concat boundary)
+        2. Extract backbone-only ONNX sub-graph
+        3. Get feature dimensions from the extracted (not full) model
+        4. Sanitize ONNX node names for TF compatibility
+        5. Convert to TF SavedModel via onnx2tf
 
     Args:
         nudenet_onnx_path: Path to NudeNet ``best.onnx``.  Auto-detected
@@ -181,10 +275,14 @@ def convert_backbone(
     if nudenet_onnx_path is None:
         nudenet_onnx_path = find_nudenet_onnx()
 
-    # 1. Discover backbone node and feature dimension
-    onnx_model = onnx.load(nudenet_onnx_path)
-    backbone_node = _find_backbone_node(onnx_model)
-    feat_shape = _get_backbone_feature_dim(nudenet_onnx_path, backbone_node)
+    # 1. Extract backbone-only ONNX (before running inference on full model)
+    os.makedirs(cache_dir, exist_ok=True)
+    backbone_onnx = os.path.join(cache_dir, "backbone.onnx")
+    _extract_backbone_onnx(nudenet_onnx_path, backbone_onnx)
+
+    # 2. Get feature dimensions from the *extracted* backbone
+    #    (avoids Concat shape errors in the full model's FPN)
+    feat_shape = _get_backbone_feature_dim_from_extracted(backbone_onnx)
     feature_channels = int(feat_shape[1])  # NCHW
     logger.info(
         "Backbone feature shape (NCHW): %s  channels=%d",
@@ -192,20 +290,22 @@ def convert_backbone(
         feature_channels,
     )
 
-    # 2. Extract backbone-only ONNX
-    backbone_onnx = os.path.join(cache_dir, "backbone.onnx")
-    _extract_backbone_onnx(nudenet_onnx_path, backbone_onnx)
+    # 3. Sanitize ONNX node names for TF naming rules
+    _sanitize_onnx_names(backbone_onnx)
 
-    # 3. Convert to TF
+    # 4. Convert to TF SavedModel
     logger.info("Converting backbone ONNX -> TF SavedModel ...")
     onnx2tf.convert(
         input_onnx_file_path=backbone_onnx,
         output_folder_path=cache_dir,
         non_verbose=True,
         copy_onnx_input_output_names_to_tflite=False,
+        output_signaturedefs=True,
     )
 
-    # 4. Save metadata
+    # 5. Save metadata
+    onnx_model = onnx.load(nudenet_onnx_path)
+    backbone_node = _find_backbone_node(onnx_model)
     meta = {
         "backbone_node": backbone_node,
         "feature_channels": feature_channels,

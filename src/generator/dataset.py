@@ -138,32 +138,57 @@ class NSFWImageDataset(Dataset):
 
 
 def create_dataloaders(
-    train_dir: str,
-    val_dir: str | None = None,
+    data_dir: str,
     image_size: int = 320,
     batch_size: int = 8,
     num_workers: int = 4,
     pin_memory: bool = True,
-) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader | None]:
+    val_ratio: float = 0.15,
+    seed: int = 42,
+) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """学習用・検証用 DataLoader を作成する。
 
+    単一ディレクトリの画像を指定比率で train/val に自動分割する。
+    分割はシード値で決定論的に行われるため、再実行でも同じ分割になる。
+
     Args:
-        train_dir: 学習画像ディレクトリ。
-        val_dir: 検証画像ディレクトリ（Noneで検証なし）。
+        data_dir: 画像ファイルが格納されたディレクトリパス。
         image_size: リサイズ先の画像サイズ。
         batch_size: バッチサイズ。
         num_workers: データ読み込みのワーカー数。
         pin_memory: CUDAピンメモリを使用するか。
+        val_ratio: 検証用データの割合（デフォルト: 0.15 = 15%）。
+        seed: 分割のシード値（再現性のため）。
 
     Returns:
-        (train_loader, val_loader) のタプル。val_loaderはNoneの場合あり。
+        (train_loader, val_loader) のタプル。
     """
+    # 全画像パスを収集
+    all_paths = NSFWImageDataset._collect_image_paths(data_dir, SUPPORTED_EXTENSIONS)
+    total = len(all_paths)
+
+    # シード固定で決定論的にシャッフル→分割
+    rng = np.random.default_rng(seed)
+    indices = np.arange(total)
+    rng.shuffle(indices)
+
+    val_count = max(1, int(total * val_ratio))
+    val_indices = set(indices[:val_count].tolist())
+    train_paths = [p for i, p in enumerate(all_paths) if i not in val_indices]
+    val_paths = [p for i, p in enumerate(all_paths) if i in val_indices]
+
+    logger.info(
+        "データ分割: 全 %d 枚 → 学習 %d 枚 (%.0f%%) / 検証 %d 枚 (%.0f%%)",
+        total, len(train_paths), (1 - val_ratio) * 100,
+        len(val_paths), val_ratio * 100,
+    )
+
     # 学習用データセット（データ拡張あり）
     train_dataset = NSFWImageDataset(
-        image_dir=train_dir,
-        image_size=image_size,
-        augment=True,
+        image_dir=data_dir, image_size=image_size, augment=True,
     )
+    train_dataset.image_paths = train_paths
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -175,23 +200,19 @@ def create_dataloaders(
     logger.info("学習用DataLoader: %d 枚, バッチサイズ=%d", len(train_dataset), batch_size)
 
     # 検証用データセット（データ拡張なし）
-    val_loader = None
-    if val_dir and os.path.exists(val_dir):
-        val_dataset = NSFWImageDataset(
-            image_dir=val_dir,
-            image_size=image_size,
-            augment=False,
-        )
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=False,
-        )
-        logger.info("検証用DataLoader: %d 枚, バッチサイズ=%d", len(val_dataset), batch_size)
-    else:
-        logger.info("検証用ディレクトリが未指定または存在しません。検証はスキップされます。")
+    val_dataset = NSFWImageDataset(
+        image_dir=data_dir, image_size=image_size, augment=False,
+    )
+    val_dataset.image_paths = val_paths
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    logger.info("検証用DataLoader: %d 枚, バッチサイズ=%d", len(val_dataset), batch_size)
 
     return train_loader, val_loader

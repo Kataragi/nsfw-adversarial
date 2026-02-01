@@ -494,12 +494,13 @@ def train(config: dict, device_name: str | None = None) -> str:
 
     # ── DataLoader の作成 ──
     train_loader, val_loader = create_dataloaders(
-        train_dir=dataset_cfg.get("train_dir", "dataset/nsfw_images/train"),
-        val_dir=dataset_cfg.get("val_dir"),
+        data_dir=dataset_cfg.get("data_dir", "dataset/nsfw_images"),
         image_size=pipeline_cfg.get("image_size", 320),
         batch_size=train_cfg.get("batch_size", 8),
         num_workers=dataset_cfg.get("num_workers", 4),
         pin_memory=dataset_cfg.get("pin_memory", True),
+        val_ratio=dataset_cfg.get("val_ratio", 0.15),
+        seed=config.get("seed", 42),
     )
 
     # ── ジェネレータモデルの構築 ──

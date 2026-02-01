@@ -11,8 +11,8 @@ pipeline:
 
 # データセット設定
 dataset:
-  train_dir: "dataset/nsfw_images/train"
-  val_dir: "dataset/nsfw_images/val"
+  data_dir: "dataset/nsfw_images"       # 単一ディレクトリから自動分割
+  val_ratio: 0.15                       # 検証用データの割合（15%）
   extensions: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
   num_workers: 4
   pin_memory: true

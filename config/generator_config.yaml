@@ -1,0 +1,84 @@
+# 敵対的摂動ジェネレータ学習設定
+
+# パイプライン設定（分類器のパス等）
+pipeline:
+  classifier_path: "models/target_classifier/pnsfwmedia_classifier.keras"
+  projection_path: "models/nudenet_projection.npy"
+  backbone_cache_dir: "models/tf_backbone"
+  backbone_onnx_path: null  # null の場合は自動検出
+  image_size: 320
+  threshold: 0.5
+
+# データセット設定
+dataset:
+  train_dir: "dataset/nsfw_images/train"
+  val_dir: "dataset/nsfw_images/val"
+  extensions: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
+  num_workers: 4
+  pin_memory: true
+
+# ジェネレータモデル設定
+generator:
+  # UNet のチャネル数設定
+  base_channels: 32           # 最初の畳み込み層のチャネル数
+  depth: 4                    # エンコーダの段数
+  use_attention: true         # ボトルネック部分にSelf-Attention を使用
+  activation: "leaky_relu"    # 活性化関数
+  # 出力制約: 摂動の最大振幅 (L-inf) [0,1]スケール
+  max_perturbation: 0.0627    # 16/255 ≈ 0.0627
+
+# 学習設定
+training:
+  epochs: 100
+  batch_size: 8
+  learning_rate: 0.0002
+  betas: [0.5, 0.999]        # Adam のモーメンタム係数
+  weight_decay: 0.0001
+
+  # 損失関数の重み
+  lambda_cls: 1.0             # 分類損失の重み（NSFWをSFWに誤分類させる）
+  lambda_l2: 10.0             # L2摂動ペナルティの重み
+  lambda_lpips: 0.0           # LPIPS知覚損失の重み（0で無効化）
+
+  # 分類損失のターゲット
+  target_prob: 0.0            # SFW を意味する目標確率
+
+  # 学習率スケジューラ
+  scheduler:
+    type: "cosine"            # cosine | step | none
+    warmup_epochs: 5          # ウォームアップエポック数
+    min_lr: 0.00001           # 最小学習率
+
+  # 勾配クリッピング
+  grad_clip_norm: 1.0
+
+  # 早期停止
+  early_stopping:
+    enabled: true
+    patience: 15              # 改善がないエポック数
+    metric: "val_success_rate"
+
+# 評価設定
+evaluation:
+  eval_interval: 1            # 何エポックごとに検証するか
+  thresholds: [0.3, 0.4, 0.5]
+  num_visualize: 8            # TensorBoard に表示するサンプル数
+
+# チェックポイント設定
+checkpoint:
+  save_dir: "checkpoints/generator"
+  save_interval: 5            # 何エポックごとに保存するか
+  save_best: true             # 最良モデルを保存
+
+# TensorBoard 設定
+tensorboard:
+  log_dir: "logs/generator"
+  enabled: true
+
+# 出力設定
+output:
+  results_dir: "experiments/generator_results"
+  save_perturbed_images: true
+
+# シード値（再現性のため）
+seed: 42

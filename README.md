@@ -204,6 +204,73 @@ tensorboard --logdir logs
 | `avg_linf_norm_pixel` | 摂動のL-inf ノルム平均 ([0,255]スケール) |
 | `avg_iterations` | 反復攻撃の平均収束回数 |
 
+## ジェネレータベース敵対的摂動 (PyTorch)
+
+画像ごとの最適化（FGSM/PGD等）に加え、PyTorchベースのUNetジェネレータを学習させることで、**1回の順伝播で**NSFW画像に敵対的摂動を付与できます。
+
+### アーキテクチャ
+
+```
+NSFW画像 (N, 3, 320, 320) [0, 1]
+  -> ジェネレータ G (UNet)
+  -> 摂動マップ δ (tanh -> max_perturbation でスケール)
+  -> 摂動済み画像 x' = clamp(x + δ, 0, 1)
+  -> 凍結済み分類器 f(x') -> NSFW確率
+  -> 損失: L = λ_cls * BCE(f(x'), 0) + λ_l2 * ||x' - x||_2
+```
+
+### ジェネレータ学習
+
+```bash
+# 基本的な学習
+python -m src.generator.train \
+    --config config/generator_config.yaml \
+    --train-dir dataset/nsfw_images/train \
+    --val-dir dataset/nsfw_images/val
+
+# パラメータをカスタマイズ
+python -m src.generator.train \
+    --config config/generator_config.yaml \
+    --train-dir dataset/nsfw_images/train \
+    --val-dir dataset/nsfw_images/val \
+    --epochs 100 \
+    --batch-size 8 \
+    --lr 0.0002 \
+    --lambda-cls 1.0 \
+    --lambda-l2 10.0 \
+    --max-perturbation 0.0627
+
+# チェックポイントから学習を再開
+python -m src.generator.train \
+    --config config/generator_config.yaml \
+    --train-dir dataset/nsfw_images/train \
+    --resume checkpoints/generator/generator_epoch0050.pt
+```
+
+### ジェネレータ学習のTensorBoardモニタリング
+
+```bash
+tensorboard --logdir logs/generator
+```
+
+以下の指標を確認できます:
+- エポック/バッチ単位の損失推移（分類損失、L2ペナルティ）
+- 学習率の推移
+- 検証セットでの攻撃成功率 (SR@0.5, SR@0.4, SR@0.3)
+- サンプル画像（元画像・摂動済み画像・摂動マップ）
+
+### ジェネレータの設定パラメータ
+
+| パラメータ | 説明 | 推奨値 |
+|-----------|------|--------|
+| `max_perturbation` | 摂動のL-inf上限 [0,1]スケール | 8~16/255 |
+| `lambda_cls` | 分類損失の重み | 1.0 |
+| `lambda_l2` | L2摂動ペナルティの重み | 5.0~20.0 |
+| `base_channels` | UNetの基本チャネル数 | 32 |
+| `depth` | UNetのエンコーダ段数 | 4 |
+| `learning_rate` | Adam学習率 | 1e-4~5e-4 |
+| `scheduler` | 学習率スケジューラ | cosine (warmup=5) |
+
 ## プロジェクト構成
 
 ```
@@ -212,7 +279,8 @@ nsfw-adversarial/
 ├── requirements.txt
 ├── .gitignore
 ├── config/
-│   └── attack_config.yaml       # 攻撃パラメータ設定
+│   ├── attack_config.yaml       # 攻撃パラメータ設定
+│   └── generator_config.yaml    # ジェネレータ学習設定
 ├── src/
 │   ├── __init__.py
 │   ├── pipeline.py              # エンドツーエンドパイプライン (ONNX->TF変換)
@@ -222,13 +290,22 @@ nsfw-adversarial/
 │   │   ├── pgd.py               # PGD攻撃 (画像)
 │   │   ├── cw.py                # C&W攻撃 (画像)
 │   │   └── deepfool.py          # DeepFool攻撃 (画像)
+│   ├── generator/
+│   │   ├── __init__.py
+│   │   ├── model.py             # UNetジェネレータ (PyTorch)
+│   │   ├── classifier_wrapper.py # 分類器のPyTorchラッパー
+│   │   ├── dataset.py           # NSFW画像データセット
+│   │   └── train.py             # ジェネレータ学習スクリプト
 │   ├── image_attacker.py        # 攻撃オーケストレーション
 │   ├── noise_generator.py       # CLI メインスクリプト
 │   ├── evaluate_robustness.py   # ロバスト性評価・可視化
 │   └── utils.py                 # ユーティリティ (画像I/O、メトリクス)
 ├── models/
 │   ├── target_classifier/       # pNSFWMedia分類器
-│   └── tf_backbone/             # NudeNetバックボーン (自動生成)
+│   ├── tf_backbone/             # NudeNetバックボーン TF版 (自動生成)
+│   └── torch_backbone/          # NudeNetバックボーン PyTorch版 (自動生成)
+├── checkpoints/
+│   └── generator/               # ジェネレータのチェックポイント
 ├── experiments/
 │   ├── attack_results/
 │   └── visualizations/

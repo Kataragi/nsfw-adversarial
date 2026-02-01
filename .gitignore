@@ -23,12 +23,17 @@ dataset/
 models/target_classifier/*.keras
 models/target_classifier/*.h5
 models/tf_backbone/
+models/torch_backbone/
 models/*.npy
 *.onnx
+
+# Checkpoints
+checkpoints/
 
 # Experiment outputs
 experiments/attack_results/
 experiments/visualizations/
+experiments/generator_results/
 
 # TensorBoard
 logs/

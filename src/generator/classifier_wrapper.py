@@ -315,6 +315,12 @@ def _load_keras_classifier_weights(
     .keras ファイル（ZIP アーカイブ）内の model.weights.h5 を
     h5py で直接読み込み、TensorFlow に依存せずに重みを取得する。
 
+    Keras 3 の HDF5 レイアウトは複数パターンが存在する:
+        - パターン A: グループ内に ``kernel:0``, ``bias:0`` データセット
+        - パターン B: フラットに ``0``, ``1``, ``2``, ... と番号付きデータセット
+    両方のパターンに対応するため、config.json からDense層の構成を読み取り、
+    重みの並び順と形状から正しくペアリングする。
+
     Args:
         classifier_path: .keras ファイルのパス。
 
@@ -326,9 +332,15 @@ def _load_keras_classifier_weights(
 
     import h5py
 
-    # .keras ファイルは ZIP アーカイブ。中の model.weights.h5 を抽出する
     with zipfile.ZipFile(classifier_path, "r") as zf:
         names = zf.namelist()
+
+        # config.json からDense層の構成情報を取得
+        config_data = None
+        if "config.json" in names:
+            with zf.open("config.json") as cf:
+                config_data = json.loads(cf.read())
+
         # weights ファイルを探す
         weight_file = None
         for name in names:
@@ -341,17 +353,30 @@ def _load_keras_classifier_weights(
                 f" 含まれるファイル: {names}"
             )
 
-        # 一時ファイルに展開して h5py で読み込む
         with tempfile.TemporaryDirectory() as tmpdir:
             extracted = zf.extract(weight_file, tmpdir)
 
-            layers: list[tuple[np.ndarray, np.ndarray]] = []
+            # まず HDF5 の全構造をダンプしてデバッグ情報を出力
+            all_datasets: list[tuple[str, tuple]] = []
             with h5py.File(extracted, "r") as f:
-                # HDF5 構造を再帰探索し kernel:0 / bias:0 のペアを収集
+
+                def _collect_datasets(name: str, obj: object) -> None:
+                    if isinstance(obj, h5py.Dataset):
+                        all_datasets.append((name, obj.shape))
+
+                f.visititems(_collect_datasets)
+                logger.info(
+                    "HDF5 内のデータセット一覧 (%d 個):", len(all_datasets)
+                )
+                for ds_name, ds_shape in all_datasets:
+                    logger.info("  %s: %s", ds_name, ds_shape)
+
+                # === パターン A: kernel/bias を含むグループを探す ===
+                layers: list[tuple[np.ndarray, np.ndarray]] = []
+
                 dense_groups: list[h5py.Group] = []
 
                 def _find_dense_groups(group: h5py.Group) -> None:
-                    """kernel:0 と bias:0 の両方を持つグループを探す。"""
                     has_kernel = any("kernel" in k for k in group.keys())
                     has_bias = any("bias" in k for k in group.keys())
                     if has_kernel and has_bias:
@@ -364,18 +389,55 @@ def _load_keras_classifier_weights(
 
                 _find_dense_groups(f)
 
-                for grp in dense_groups:
-                    # kernel:0 と bias:0 を取得
-                    kernel_key = [k for k in grp.keys() if "kernel" in k][0]
-                    bias_key = [k for k in grp.keys() if "bias" in k][0]
-                    w = np.array(grp[kernel_key], dtype=np.float32)  # (in, out)
-                    b = np.array(grp[bias_key], dtype=np.float32)    # (out,)
-                    layers.append((w, b))
-                    logger.info(
-                        "  Dense層を抽出: 入力=%d, 出力=%d",
-                        w.shape[0],
-                        w.shape[1],
-                    )
+                if dense_groups:
+                    for grp in dense_groups:
+                        kernel_key = [k for k in grp.keys() if "kernel" in k][0]
+                        bias_key = [k for k in grp.keys() if "bias" in k][0]
+                        w = np.array(grp[kernel_key], dtype=np.float32)
+                        b = np.array(grp[bias_key], dtype=np.float32)
+                        layers.append((w, b))
+                        logger.info(
+                            "  Dense層を抽出 (パターンA): 入力=%d, 出力=%d",
+                            w.shape[0], w.shape[1],
+                        )
+
+                # === パターン B: フラット番号式 (Keras 3) ===
+                # データセットが "0", "1", "2", ... のように番号で並んでいる場合、
+                # 2Dテンソル (in, out) = kernel、1Dテンソル (out,) = bias とみなす
+                if not layers:
+                    logger.info("パターンA未検出。パターンB（フラット番号式）を試行 ...")
+                    flat_arrays: list[np.ndarray] = []
+
+                    # 全データセットを出現順に収集
+                    def _collect_arrays(group: h5py.Group) -> None:
+                        # 数値キーでソートして順序を保証
+                        keys = sorted(group.keys(), key=lambda k: (
+                            int(k) if k.isdigit() else float("inf"), k
+                        ))
+                        for key in keys:
+                            item = group[key]
+                            if isinstance(item, h5py.Dataset):
+                                flat_arrays.append(
+                                    np.array(item, dtype=np.float32)
+                                )
+                            elif isinstance(item, h5py.Group):
+                                _collect_arrays(item)
+
+                    _collect_arrays(f)
+
+                    # 2D + 1D のペアを順に組み立てる
+                    i = 0
+                    while i < len(flat_arrays) - 1:
+                        a, b = flat_arrays[i], flat_arrays[i + 1]
+                        if a.ndim == 2 and b.ndim == 1 and a.shape[1] == b.shape[0]:
+                            layers.append((a, b))
+                            logger.info(
+                                "  Dense層を抽出 (パターンB): 入力=%d, 出力=%d",
+                                a.shape[0], a.shape[1],
+                            )
+                            i += 2
+                        else:
+                            i += 1
 
     if not layers:
         raise ValueError(

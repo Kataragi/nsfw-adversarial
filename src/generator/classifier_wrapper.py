@@ -5,9 +5,15 @@ PyTorchのnn.Moduleとしてラップし、ジェネレータ学習時に勾配�
 
 方式:
     1. NudeNetバックボーン (ONNX) -> onnx2torch で PyTorch化
-    2. 射影行列 (numpy) -> nn.Linear として読み込み
+    2. 射影行列 -> ファイルがあれば読み込み、なければ QR 分解 (seed=42) で再現生成
     3. pNSFWMedia分類器 (Keras) -> 重みを抽出し PyTorch MLP に変換
     4. 全パラメータを凍結 (requires_grad=False)
+
+射影行列について:
+    pNSFWMedia の extract_embeddings_nudenet.py で生成される直交射影行列は
+    numpy.random.default_rng(seed=42) + QR 分解で決定論的に求まる。
+    したがって nudenet_projection.npy が存在しなくても
+    バックボーンのチャネル数さえ判明すれば同一の行列を再現できる。
 
 パイプライン:
     画像 (N, 3, 320, 320) [0, 1]
@@ -125,6 +131,75 @@ def _get_backbone_feature_dim(onnx_path: str, node_name: str) -> tuple[int, ...]
 
     out = sess.run([node_name], {input_info.name: dummy})[0]
     return out.shape  # (1, C, H, W)
+
+
+def create_orthogonal_projection(
+    feature_dim: int, output_dim: int = 256, seed: int = 42
+) -> np.ndarray:
+    """pNSFWMedia と同一の直交射影行列を決定論的に生成する。
+
+    pNSFWMedia/src/extract_embeddings_nudenet.py の
+    _create_orthogonal_projection() と完全に同じアルゴリズム。
+    QR 分解を用いるため seed さえ同じなら常に同一の行列が得られる。
+
+    Args:
+        feature_dim: バックボーン出力のチャネル数 (C)。
+        output_dim: 射影先の次元数（デフォルト 256）。
+        seed: 乱数シード（pNSFWMedia のデフォルトは 42）。
+
+    Returns:
+        (feature_dim, output_dim) 形状の float32 直交行列。
+    """
+    rng = np.random.default_rng(seed=seed)
+    random_matrix = rng.standard_normal((feature_dim, output_dim))
+    q, _ = np.linalg.qr(random_matrix)
+    if q.shape[1] < output_dim:
+        pad = rng.standard_normal((feature_dim, output_dim - q.shape[1]))
+        q = np.hstack([q, pad])
+    return q[:, :output_dim].astype(np.float32)
+
+
+def load_or_create_projection(
+    feature_channels: int,
+    projection_path: str | None = None,
+    output_dim: int = 256,
+) -> np.ndarray:
+    """射影行列をファイルから読み込むか、存在しなければ自動生成する。
+
+    Args:
+        feature_channels: バックボーン出力チャネル数。
+        projection_path: .npy ファイルのパス。None または存在しない場合は自動生成。
+        output_dim: 射影先の次元数。
+
+    Returns:
+        (feature_channels, output_dim) 形状の float32 行列。
+    """
+    if projection_path and os.path.exists(projection_path):
+        projection = np.load(projection_path).astype(np.float32)
+        if projection.shape[0] != feature_channels:
+            raise ValueError(
+                f"射影行列の第1次元 ({projection.shape[0]}) != "
+                f"バックボーンチャネル数 ({feature_channels})"
+            )
+        logger.info("射影行列をファイルから読み込み: %s %s", projection_path, projection.shape)
+        return projection
+
+    # ファイルが存在しない場合は pNSFWMedia と同一アルゴリズムで生成
+    logger.info(
+        "射影行列ファイルが見つかりません。QR分解 (seed=42) で自動生成します "
+        "(feature_dim=%d -> %d)",
+        feature_channels,
+        output_dim,
+    )
+    projection = create_orthogonal_projection(feature_channels, output_dim)
+
+    # 生成した行列をキャッシュとして保存
+    save_path = projection_path or "models/nudenet_projection.npy"
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    np.save(save_path, projection)
+    logger.info("生成した射影行列を保存: %s", save_path)
+
+    return projection
 
 
 def convert_backbone_to_pytorch(
@@ -372,12 +447,11 @@ def build_frozen_classifier(
         cache_dir=backbone_cache_dir,
     )
 
-    # 2. 射影行列の読み込み
-    logger.info("[2/3] 射影行列を読み込み中 ...")
-    projection = np.load(projection_path).astype(np.float32)
-    assert projection.shape[0] == feature_channels, (
-        f"射影行列の第1次元 ({projection.shape[0]}) != "
-        f"バックボーンチャネル数 ({feature_channels})"
+    # 2. 射影行列の読み込み（ファイルが無ければ自動生成）
+    logger.info("[2/3] 射影行列を準備中 ...")
+    projection = load_or_create_projection(
+        feature_channels=feature_channels,
+        projection_path=projection_path,
     )
     logger.info("射影行列の形状: %s", projection.shape)
 

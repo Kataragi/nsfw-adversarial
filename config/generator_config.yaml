@@ -3,8 +3,8 @@
 # パイプライン設定（分類器のパス等）
 pipeline:
   classifier_path: "models/target_classifier/pnsfwmedia_classifier.keras"
-  projection_path: "models/nudenet_projection.npy"
-  backbone_cache_dir: "models/tf_backbone"
+  projection_path: "models/nudenet_projection.npy"  # ファイルが無い場合はQR分解(seed=42)で自動生成
+  backbone_cache_dir: "models/torch_backbone"
   backbone_onnx_path: null  # null の場合は自動検出
   image_size: 320
   threshold: 0.5

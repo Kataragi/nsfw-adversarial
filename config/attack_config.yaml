@@ -3,7 +3,7 @@
 # Pipeline settings
 pipeline:
   classifier_path: "models/target_classifier/pnsfwmedia_classifier.keras"
-  projection_path: "models/nudenet_projection.npy"
+  projection_path: "models/nudenet_projection.npy"  # auto-generated via QR(seed=42) if missing
   backbone_cache_dir: "models/tf_backbone"
   image_size: 320
   threshold: 0.5

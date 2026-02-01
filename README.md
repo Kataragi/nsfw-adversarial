@@ -76,18 +76,24 @@ git submodule add https://github.com/Kataragi/pNSFWMedia.git models/pNSFWMedia
 cp models/pNSFWMedia/models/pnsfwmedia_classifier.keras models/target_classifier/
 ```
 
-#### 2. 射影行列
+#### 2. 射影行列（自動生成）
 
-pNSFWMediaの埋め込み抽出時に生成される射影行列を配置:
+NudeNetバックボーン出力を256次元に射影する直交行列です。
+pNSFWMedia の `extract_embeddings_nudenet.py` と同一の QR 分解アルゴリズム（seed=42）で
+**初回実行時に自動生成**されるため、手動配置は不要です。
+
+生成された行列は `models/nudenet_projection.npy` にキャッシュされます。
+既に pNSFWMedia で生成済みのファイルがある場合はそれを配置しても構いません:
 
 ```bash
+# （任意）既存ファイルがある場合のみ
 cp /path/to/pNSFWMedia/models/nudenet_projection.npy models/
 ```
 
 #### 3. NudeNet ONNXモデル
 
 `pip install nudenet` でインストールすると自動的に `best.onnx` が配置されます。
-初回実行時にONNXバックボーンがTensorFlow形式に自動変換され、`models/tf_backbone/` にキャッシュされます。
+初回実行時にONNXバックボーンがTensorFlow / PyTorch形式に自動変換され、`models/tf_backbone/` または `models/torch_backbone/` にキャッシュされます。
 
 #### 4. 攻撃対象画像
 

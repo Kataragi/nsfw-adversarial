@@ -4,6 +4,12 @@ Converts the NudeNet ONNX backbone to TensorFlow, then chains it with
 the orthogonal projection and pNSFWMedia classifier so that
 tf.GradientTape can compute image-level gradients for adversarial attacks.
 
+Projection matrix:
+    The (C, 256) orthogonal projection is deterministically generated
+    using QR decomposition with numpy.random.default_rng(seed=42),
+    matching pNSFWMedia/src/extract_embeddings_nudenet.py.
+    If the .npy file does not exist it is regenerated automatically.
+
 Pipeline:
     Image (N,320,320,3) [0,1]
     -> NudeNet backbone (TF, converted from ONNX)
@@ -206,6 +212,81 @@ def convert_backbone(
     return cache_dir
 
 
+# ── Projection matrix ─────────────────────────────────────────────
+
+
+def create_orthogonal_projection(
+    feature_dim: int, output_dim: int = 256, seed: int = 42
+) -> np.ndarray:
+    """Deterministically create the same orthogonal projection as pNSFWMedia.
+
+    Reproduces pNSFWMedia/src/extract_embeddings_nudenet.py
+    ``_create_orthogonal_projection()`` exactly.  Uses QR decomposition
+    with ``numpy.random.default_rng(seed=42)`` so the result is always
+    identical given the same *feature_dim*.
+
+    Args:
+        feature_dim: Backbone output channels (C).
+        output_dim: Target dimensionality (default 256).
+        seed: Random seed (pNSFWMedia default is 42).
+
+    Returns:
+        ``(feature_dim, output_dim)`` float32 orthogonal matrix.
+    """
+    rng = np.random.default_rng(seed=seed)
+    random_matrix = rng.standard_normal((feature_dim, output_dim))
+    q, _ = np.linalg.qr(random_matrix)
+    if q.shape[1] < output_dim:
+        pad = rng.standard_normal((feature_dim, output_dim - q.shape[1]))
+        q = np.hstack([q, pad])
+    return q[:, :output_dim].astype(np.float32)
+
+
+def load_or_create_projection(
+    feature_channels: int,
+    projection_path: str | None = None,
+    output_dim: int = 256,
+) -> np.ndarray:
+    """Load the projection matrix from file, or auto-generate if missing.
+
+    When the ``.npy`` file does not exist the matrix is regenerated using
+    QR decomposition (seed=42), which is identical to the one produced by
+    pNSFWMedia.  The generated matrix is saved for future runs.
+
+    Args:
+        feature_channels: Backbone output channels.
+        projection_path: Path to ``.npy`` file (may be *None* or non-existent).
+        output_dim: Target dimensionality.
+
+    Returns:
+        ``(feature_channels, output_dim)`` float32 matrix.
+    """
+    if projection_path and os.path.exists(projection_path):
+        projection = np.load(projection_path).astype(np.float32)
+        if projection.shape[0] != feature_channels:
+            raise ValueError(
+                f"Projection matrix first dim ({projection.shape[0]}) != "
+                f"backbone channels ({feature_channels})"
+            )
+        logger.info("Projection matrix loaded: %s %s", projection_path, projection.shape)
+        return projection
+
+    logger.info(
+        "Projection file not found – auto-generating via QR (seed=42) "
+        "(feature_dim=%d -> %d)",
+        feature_channels,
+        output_dim,
+    )
+    projection = create_orthogonal_projection(feature_channels, output_dim)
+
+    save_path = projection_path or "models/nudenet_projection.npy"
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    np.save(save_path, projection)
+    logger.info("Saved generated projection to %s", save_path)
+
+    return projection
+
+
 # ── End-to-end differentiable model ───────────────────────────────
 
 
@@ -370,11 +451,10 @@ def build_pipeline(
     is_nhwc = _detect_backbone_format(backbone, feature_channels)
     logger.info("Backbone output format: %s", "NHWC" if is_nhwc else "NCHW")
 
-    # Load projection matrix
-    projection = np.load(projection_path).astype(np.float32)
-    assert projection.shape[0] == feature_channels, (
-        f"Projection matrix first dim ({projection.shape[0]}) != "
-        f"backbone channels ({feature_channels})"
+    # Load projection matrix (auto-generate if file is missing)
+    projection = load_or_create_projection(
+        feature_channels=feature_channels,
+        projection_path=projection_path,
     )
     logger.info("Projection matrix: %s", projection.shape)
 

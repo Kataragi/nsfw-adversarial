@@ -554,6 +554,40 @@ class FrozenNSFWClassifier(nn.Module):
         super().train(False)
         return self
 
+    @staticmethod
+    def _extract_tensor(raw_output: object) -> torch.Tensor:
+        """バックボーン出力からテンソルを抽出する。
+
+        onnx2torch はモデルによって Tensor / tuple / list / OrderedDict
+        のいずれかを返す可能性がある。最も大きい 4D テンソルを返す。
+        """
+        if isinstance(raw_output, torch.Tensor):
+            return raw_output
+
+        # tuple / list の場合
+        if isinstance(raw_output, (tuple, list)):
+            # 4Dテンソルを優先、なければ最大要素数のテンソルを選択
+            tensors = [t for t in raw_output if isinstance(t, torch.Tensor)]
+            four_d = [t for t in tensors if t.dim() == 4]
+            if four_d:
+                return max(four_d, key=lambda t: t.numel())
+            if tensors:
+                return max(tensors, key=lambda t: t.numel())
+
+        # dict / OrderedDict の場合
+        if isinstance(raw_output, dict):
+            tensors = [v for v in raw_output.values() if isinstance(v, torch.Tensor)]
+            four_d = [t for t in tensors if t.dim() == 4]
+            if four_d:
+                return max(four_d, key=lambda t: t.numel())
+            if tensors:
+                return max(tensors, key=lambda t: t.numel())
+
+        raise TypeError(
+            f"バックボーン出力の型が不正です: {type(raw_output)}。"
+            f" Tensor / tuple / list / dict のいずれかが必要です。"
+        )
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """順伝播。
 
@@ -564,11 +598,14 @@ class FrozenNSFWClassifier(nn.Module):
             NSFW確率 (N, 1)。
         """
         # バックボーン特徴抽出 (NCHW出力)
-        features = self.backbone(images)
+        raw = self.backbone(images)
+        features = self._extract_tensor(raw)
 
         # Global Average Pooling (空間軸: H, W)
         if features.dim() == 4:
             pooled = features.mean(dim=[2, 3])  # (N, C)
+        elif features.dim() == 3:
+            pooled = features.mean(dim=2)  # (N, C)
         else:
             pooled = features
 
@@ -633,10 +670,44 @@ def build_frozen_classifier(
     )
     model = model.to(device)
 
-    # ダミー入力で動作確認
+    # ダミー入力でステップごとに動作確認
     dummy = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
     with torch.no_grad():
-        out = model(dummy)
+        # 1. バックボーン
+        raw = backbone(dummy.to(device))
+        logger.info("バックボーン出力型: %s", type(raw))
+        if isinstance(raw, torch.Tensor):
+            logger.info("バックボーン出力形状: %s", raw.shape)
+        elif isinstance(raw, (tuple, list)):
+            for idx, t in enumerate(raw):
+                if isinstance(t, torch.Tensor):
+                    logger.info("バックボーン出力[%d]: %s", idx, t.shape)
+        elif isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, torch.Tensor):
+                    logger.info("バックボーン出力[%s]: %s", k, v.shape)
+
+        features = FrozenNSFWClassifier._extract_tensor(raw)
+        logger.info("抽出後の特徴形状: %s", features.shape)
+
+        # 2. GAP
+        if features.dim() == 4:
+            pooled = features.mean(dim=[2, 3])
+        elif features.dim() == 3:
+            pooled = features.mean(dim=2)
+        else:
+            pooled = features
+        logger.info("GAP後の形状: %s (期待: (1, %d))", pooled.shape, feature_channels)
+
+        # 3. 射影
+        projected = model.projection(pooled)
+        logger.info("射影後の形状: %s (期待: (1, 256))", projected.shape)
+
+        # 4. 分類器
+        normalized = F.normalize(projected, p=2, dim=1)
+        out = model.classifier_mlp(normalized)
+        logger.info("分類器出力形状: %s", out.shape)
+
     logger.info("パイプライン検証完了 - ダミー出力形状: %s", out.shape)
     logger.info("=== 凍結済み分類パイプラインの構築完了 ===")
 

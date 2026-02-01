@@ -237,6 +237,27 @@ def load_or_create_projection(
     return projection
 
 
+def _get_backbone_channels(backbone: nn.Module) -> int:
+    """PyTorchバックボーンのダミー推論で実際の出力チャネル数を取得する。
+
+    onnx2torch 変換後のモデルはタプル/辞書を返す場合があるため、
+    それらを展開して最初のテンソルからチャネル数を判定する。
+    """
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        out = backbone(dummy)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        elif isinstance(out, dict):
+            out = next(iter(out.values()))
+        if out.dim() == 4:
+            return int(out.shape[1])
+        elif out.dim() == 2:
+            return int(out.shape[1])
+        else:
+            return int(out.shape[-1])
+
+
 def convert_backbone_to_pytorch(
     nudenet_onnx_path: str | None = None,
     cache_dir: str = "models/torch_backbone",
@@ -266,7 +287,19 @@ def convert_backbone_to_pytorch(
             meta = json.load(f)
         backbone = torch.load(pt_path, map_location="cpu", weights_only=False)
         backbone.eval()
-        return backbone, meta["feature_channels"]
+
+        # キャッシュ済みモデルの実際の出力形状を検証
+        cached_channels = meta["feature_channels"]
+        actual_channels = _get_backbone_channels(backbone)
+        if actual_channels != cached_channels:
+            logger.warning(
+                "キャッシュのチャネル数=%d と実際の出力チャネル数=%d が不一致。"
+                "実際の値を使用します。",
+                cached_channels,
+                actual_channels,
+            )
+            cached_channels = actual_channels
+        return backbone, cached_channels
 
     if nudenet_onnx_path is None:
         nudenet_onnx_path = find_nudenet_onnx()
@@ -289,6 +322,21 @@ def convert_backbone_to_pytorch(
     onnx_model = onnx.load(backbone_onnx)
     backbone = convert(onnx_model)
     backbone.eval()
+
+    # PyTorch変換後の実際の出力形状を検証
+    actual_channels = _get_backbone_channels(backbone)
+    if actual_channels != feature_channels:
+        logger.warning(
+            "ONNX推論のチャネル数=%d と onnx2torch 変換後のチャネル数=%d が不一致。"
+            "PyTorch側の値 (%d) を使用します。",
+            feature_channels,
+            actual_channels,
+            actual_channels,
+        )
+        feature_channels = actual_channels
+    logger.info(
+        "PyTorch バックボーン検証完了 (チャネル数=%d)", feature_channels,
+    )
 
     # キャッシュに保存
     torch.save(backbone, pt_path)
@@ -566,11 +614,21 @@ class FrozenNSFWClassifier(nn.Module):
         # バックボーン特徴抽出 (NCHW出力)
         features = self.backbone(images)
 
+        # onnx2torch がタプル/リスト/辞書で返す場合がある
+        if isinstance(features, (tuple, list)):
+            features = features[0]
+        elif isinstance(features, dict):
+            features = next(iter(features.values()))
+
         # Global Average Pooling (空間軸: H, W)
         if features.dim() == 4:
             pooled = features.mean(dim=[2, 3])  # (N, C)
+        elif features.dim() == 2:
+            pooled = features  # (N, C) — すでにプーリング済み
         else:
-            pooled = features
+            raise RuntimeError(
+                f"バックボーン出力の次元数が想定外です: {features.shape}"
+            )
 
         # 直交射影 (C -> 256)
         projected = self.projection(pooled)  # (N, 256)

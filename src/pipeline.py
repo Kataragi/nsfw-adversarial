@@ -440,7 +440,12 @@ class EndToEndModel(tf.keras.Model):
             NSFW probabilities ``(N, 1)``.
         """
         # onnx2tf converts to NHWC by default so input is already (N,H,W,C)
-        features = self.backbone(images, training=False)
+        out = self.backbone(images, training=False)
+        # TFSMLayer returns a dict keyed by output name – extract the tensor
+        if isinstance(out, dict):
+            features = next(iter(out.values()))
+        else:
+            features = out
 
         # GAP – spatial axes depend on data format
         if self._output_nhwc:
@@ -501,7 +506,9 @@ def _detect_backbone_format(
 ) -> bool:
     """Return True if the backbone outputs NHWC."""
     dummy = tf.zeros((1, IMAGE_SIZE, IMAGE_SIZE, 3), dtype=tf.float32)
-    out = backbone(dummy, training=False)
+    raw = backbone(dummy, training=False)
+    # TFSMLayer returns a dict – extract the tensor
+    out = next(iter(raw.values())) if isinstance(raw, dict) else raw
     shape = out.shape  # (1, ?, ?, ?)
     if shape[-1] == expected_channels:
         return True  # NHWC
@@ -550,9 +557,11 @@ def build_pipeline(
         meta = json.load(f)
     feature_channels = meta["feature_channels"]
 
-    # Load TF backbone
-    backbone = tf.keras.models.load_model(backbone_cache_dir)
-    logger.info("TF backbone loaded (%d params)", backbone.count_params())
+    # Load TF backbone (SavedModel → TFSMLayer for Keras 3 compatibility)
+    backbone = tf.keras.layers.TFSMLayer(
+        backbone_cache_dir, call_endpoint="serving_default"
+    )
+    logger.info("TF backbone loaded from %s", backbone_cache_dir)
 
     # Detect output format
     is_nhwc = _detect_backbone_format(backbone, feature_channels)

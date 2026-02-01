@@ -691,10 +691,40 @@ def build_frozen_classifier(
     )
     model = model.to(device)
 
-    # ダミー入力で動作確認
+    # ダミー入力でステップごとに動作確認
     dummy = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE, device=device)
     with torch.no_grad():
-        out = model(dummy)
+        # 1. バックボーン
+        features = model.backbone(dummy)
+        if isinstance(features, (tuple, list)):
+            features = features[0]
+        elif isinstance(features, dict):
+            features = next(iter(features.values()))
+        logger.info("  バックボーン出力: %s (dim=%d)", features.shape, features.dim())
+
+        # 2. Global Average Pooling
+        if features.dim() == 4:
+            pooled = features.mean(dim=[2, 3])
+        elif features.dim() == 2:
+            pooled = features
+        else:
+            raise RuntimeError(
+                f"バックボーン出力の次元数が想定外です: {features.shape}"
+            )
+        logger.info("  プーリング後: %s", pooled.shape)
+
+        # 3. 射影
+        projected = model.projection(pooled)
+        logger.info("  射影後: %s (期待: (1, 256))", projected.shape)
+
+        # 4. L2正規化 — F.normalize で形状を保持（torch.norm は次元を縮約するため不可）
+        normalized = F.normalize(projected, p=2, dim=1)
+        logger.info("  L2正規化後: %s", normalized.shape)
+
+        # 5. MLP分類器
+        out = model.classifier_mlp(normalized)
+        logger.info("  MLP出力: %s", out.shape)
+
     logger.info("パイプライン検証完了 - ダミー出力形状: %s", out.shape)
     logger.info("=== 凍結済み分類パイプラインの構築完了 ===")
 

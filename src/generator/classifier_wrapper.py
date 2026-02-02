@@ -328,24 +328,23 @@ def _count_dense_layers_from_config(config_data: dict) -> int:
 
 def _load_keras_classifier_weights(
     classifier_path: str,
-) -> list[tuple[np.ndarray, np.ndarray]]:
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[str]]:
     """Keras分類器からDense層の重みとバイアスを抽出する。
 
     .keras ファイル（ZIP アーカイブ）内の model.weights.h5 を
     h5py で直接読み込み、TensorFlow に依存せずに重みを取得する。
 
     抽出戦略:
-        1. config.json を解析して Dense 層の数を特定
-        2. HDF5 内の全データセットを ``visititems`` で収集（パス辞書順）
-        3. パターン A: ``kernel`` / ``bias`` キーを持つグループから抽出
-        4. パターン B: 全データセットを順に走査し 2D+1D ペアを抽出
-        5. config.json の Dense 数と照合し、不足があれば警告
+        1. config.json を解析して Dense 層の構造（層名、units、activation）を特定
+        2. HDF5 から層名に基づいて直接 kernel/bias を取得
+        3. 重複を排除し、config.json の順序に従って正確に抽出
 
     Args:
         classifier_path: .keras ファイルのパス。
 
     Returns:
-        [(weight, bias), ...] のリスト。各weightは (in, out) 形状。
+        ([(weight, bias), ...], [activation, ...]) のタプル。
+        各weightは (in, out) 形状。activations は各層の活性化関数名。
     """
     import tempfile
     import zipfile
@@ -356,15 +355,37 @@ def _load_keras_classifier_weights(
         names = zf.namelist()
         logger.info(".keras ZIP 内容: %s", names)
 
-        # config.json から Dense 層数を取得
-        expected_dense = None
-        if "config.json" in names:
-            with zf.open("config.json") as cf:
-                config_data = json.loads(cf.read())
-            expected_dense = _count_dense_layers_from_config(config_data)
-            logger.info("config.json から Dense 層数を検出: %d", expected_dense)
+        # Step 1: config.json から Dense 層の構造を取得
+        if "config.json" not in names:
+            raise ValueError(f"{classifier_path} に config.json が含まれていません")
 
-        # weights ファイルを探す
+        with zf.open("config.json") as cf:
+            config_data = json.loads(cf.read())
+
+        # Sequential モデルの layers から Dense 層のみ抽出
+        expected_dense_layers = []
+        layers_config = config_data.get("config", {}).get("layers", [])
+
+        for layer_config in layers_config:
+            if layer_config.get("class_name") == "Dense":
+                layer_name = layer_config.get("config", {}).get("name", "")
+                units = layer_config.get("config", {}).get("units", 0)
+                activation = layer_config.get("config", {}).get("activation", "linear")
+                expected_dense_layers.append({
+                    "name": layer_name,
+                    "units": units,
+                    "activation": activation,
+                })
+
+        expected_count = len(expected_dense_layers)
+        logger.info("config.json から Dense=%d 層を検出", expected_count)
+        for i, info in enumerate(expected_dense_layers):
+            logger.info(
+                "  Layer %d: name=%s, units=%d, activation=%s",
+                i, info["name"], info["units"], info["activation"]
+            )
+
+        # Step 2: weights ファイルを探す
         weight_file = None
         for name in names:
             if name.endswith(".h5"):
@@ -376,128 +397,156 @@ def _load_keras_classifier_weights(
                 f" 含まれるファイル: {names}"
             )
 
+        # Step 3: HDF5 から層名に基づいて重みを抽出
         with tempfile.TemporaryDirectory() as tmpdir:
             extracted = zf.extract(weight_file, tmpdir)
 
             with h5py.File(extracted, "r") as f:
-                # visititems で全データセットをパスの辞書順に収集
-                # (h5py はアルファベット順を保証)
-                ordered_datasets: list[tuple[str, np.ndarray]] = []
+                # デバッグ用: HDF5 内の全キーを出力
+                all_keys = []
+                def _list_keys(name: str, obj: object) -> None:
+                    all_keys.append(name)
+                f.visititems(_list_keys)
+                logger.info("HDF5 内の全キー (%d 個):", len(all_keys))
+                for key in all_keys[:20]:  # 最初の20個のみ表示
+                    logger.info("  %s", key)
+                if len(all_keys) > 20:
+                    logger.info("  ... (残り %d 個)", len(all_keys) - 20)
 
-                def _visit(name: str, obj: object) -> None:
-                    if isinstance(obj, h5py.Dataset):
-                        ordered_datasets.append(
-                            (name, np.array(obj, dtype=np.float32))
+                layers = []
+                activations = []
+
+                # config.json の順序で重みを取得
+                for layer_info in expected_dense_layers:
+                    layer_name = layer_info["name"]
+
+                    # HDF5 内での層の探索パス候補
+                    # Keras 3.x では以下のパターンが考えられる：
+                    # - vars/<layer_name>/0/kernel:0, vars/<layer_name>/0/bias:0
+                    # - vars/<layer_name>/kernel:0, vars/<layer_name>/bias:0
+                    # - <layer_name>/kernel:0, <layer_name>/bias:0
+                    kernel_paths = [
+                        f"vars/{layer_name}/0/kernel:0",
+                        f"vars/{layer_name}/kernel:0",
+                        f"{layer_name}/kernel:0",
+                        f"vars/{layer_name}/0/0",  # flat-numbered layout
+                        f"vars/{layer_name}/0",
+                    ]
+                    bias_paths = [
+                        f"vars/{layer_name}/0/bias:0",
+                        f"vars/{layer_name}/bias:0",
+                        f"{layer_name}/bias:0",
+                        f"vars/{layer_name}/1/0",  # flat-numbered layout
+                        f"vars/{layer_name}/1",
+                    ]
+
+                    kernel = None
+                    bias = None
+
+                    # kernel を探す
+                    for kpath in kernel_paths:
+                        if kpath in f:
+                            kernel = np.array(f[kpath], dtype=np.float32)
+                            logger.info("  kernel found at: %s, shape=%s", kpath, kernel.shape)
+                            break
+
+                    # bias を探す
+                    for bpath in bias_paths:
+                        if bpath in f:
+                            bias = np.array(f[bpath], dtype=np.float32)
+                            logger.info("  bias found at: %s, shape=%s", bpath, bias.shape)
+                            break
+
+                    if kernel is None or bias is None:
+                        # パスが見つからない場合、層名を含むパスを探す
+                        logger.warning(
+                            "Layer '%s' の重みが標準パスで見つかりませんでした。"
+                            "層名を含むパスを検索します...",
+                            layer_name
                         )
 
-                f.visititems(_visit)
+                        for key in all_keys:
+                            if layer_name in key:
+                                if "kernel" in key and kernel is None:
+                                    kernel = np.array(f[key], dtype=np.float32)
+                                    logger.info("  kernel found at: %s, shape=%s", key, kernel.shape)
+                                elif "bias" in key and bias is None:
+                                    bias = np.array(f[key], dtype=np.float32)
+                                    logger.info("  bias found at: %s, shape=%s", key, bias.shape)
 
-                logger.info(
-                    "HDF5 内のデータセット一覧 (%d 個):",
-                    len(ordered_datasets),
-                )
-                for ds_name, ds_arr in ordered_datasets:
-                    logger.info("  %s: shape=%s", ds_name, ds_arr.shape)
-
-                # === パターン A: kernel/bias を含むグループを探す ===
-                layers: list[tuple[np.ndarray, np.ndarray]] = []
-                kernel_map: dict[str, np.ndarray] = {}
-                bias_map: dict[str, np.ndarray] = {}
-
-                for ds_name, ds_arr in ordered_datasets:
-                    parent = ds_name.rsplit("/", 1)[0] if "/" in ds_name else ""
-                    leaf = ds_name.rsplit("/", 1)[-1]
-                    if "kernel" in leaf:
-                        kernel_map[parent] = ds_arr
-                    elif "bias" in leaf:
-                        bias_map[parent] = ds_arr
-
-                # 同じ親グループに kernel と bias があればペアリング
-                for parent in sorted(kernel_map.keys()):
-                    if parent in bias_map:
-                        w, b = kernel_map[parent], bias_map[parent]
-                        layers.append((w, b))
-                        logger.info(
-                            "  Dense層を抽出 (パターンA): 入力=%d, 出力=%d [%s]",
-                            w.shape[0], w.shape[1], parent,
+                    if kernel is None or bias is None:
+                        raise ValueError(
+                            f"Layer '{layer_name}' の重みが見つかりませんでした。\n"
+                            f"HDF5内のキー: {all_keys[:10]}..."
                         )
 
-                # === パターン B: 全データセットの 2D+1D ペアリング ===
-                if not layers:
+                    layers.append((kernel, bias))
+                    activations.append(layer_info["activation"])
                     logger.info(
-                        "パターンA未検出。パターンB（順序ベース）を試行 ..."
+                        "  Dense層を抽出: %s, 入力=%d, 出力=%d, 活性化=%s",
+                        layer_name, kernel.shape[0], kernel.shape[1],
+                        layer_info["activation"]
                     )
-                    arrays = [arr for _, arr in ordered_datasets]
-                    i = 0
-                    while i < len(arrays) - 1:
-                        a, b = arrays[i], arrays[i + 1]
-                        if (a.ndim == 2 and b.ndim == 1
-                                and a.shape[1] == b.shape[0]):
-                            layers.append((a, b))
-                            logger.info(
-                                "  Dense層を抽出 (パターンB): 入力=%d, 出力=%d",
-                                a.shape[0], a.shape[1],
-                            )
-                            i += 2
-                        else:
-                            i += 1
 
-                # config.json の Dense 数と照合
-                if expected_dense is not None and len(layers) != expected_dense:
-                    logger.warning(
-                        "config.json では Dense=%d 層だが、抽出できたのは %d 層。"
-                        " 全データセットから再抽出を試みます。",
-                        expected_dense, len(layers),
-                    )
-                    # フォールバック: 全2D配列を大きい順にソートし
-                    # 各 2D に続く 1D とペアリング
-                    arrays = [arr for _, arr in ordered_datasets]
-                    layers = []
-                    i = 0
-                    while i < len(arrays) - 1:
-                        a, b = arrays[i], arrays[i + 1]
-                        if a.ndim == 2 and b.ndim == 1:
-                            layers.append((a, b))
-                            logger.info(
-                                "  Dense層を再抽出: 入力=%d, 出力=%d",
-                                a.shape[0], a.shape[1],
-                            )
-                            i += 2
-                        else:
-                            i += 1
-
-    if not layers:
+    if len(layers) != expected_count:
         raise ValueError(
-            f"分類器 {classifier_path} にDense層が見つかりませんでした"
+            f"期待される Dense 層数 {expected_count} と "
+            f"抽出された層数 {len(layers)} が一致しません"
         )
 
     logger.info("分類器から %d 個の Dense 層を抽出完了", len(layers))
-    return layers
+    return layers, activations
 
 
 class PyTorchClassifierMLP(nn.Module):
     """pNSFWMedia分類器のPyTorch再実装。
 
     Kerasモデルの重みをPyTorchのLinear層に読み込む。
-    典型的な構造: Dense(256->128, ReLU) -> Dense(128->1, Sigmoid)
+    各層の活性化関数は config.json から取得した情報に基づいて構築される。
     """
 
-    def __init__(self, keras_weights: list[tuple[np.ndarray, np.ndarray]]) -> None:
+    def __init__(
+        self,
+        keras_weights: list[tuple[np.ndarray, np.ndarray]],
+        activations: list[str],
+    ) -> None:
+        """
+        Args:
+            keras_weights: [(weight, bias), ...] のリスト。
+            activations: 各層の活性化関数名 ["tanh", "sigmoid", ...] のリスト。
+        """
         super().__init__()
+
+        if len(keras_weights) != len(activations):
+            raise ValueError(
+                f"重みの数 ({len(keras_weights)}) と活性化関数の数 ({len(activations)}) "
+                f"が一致しません"
+            )
+
         layers = []
-        for i, (w, b) in enumerate(keras_weights):
+        for i, ((w, b), act) in enumerate(zip(keras_weights, activations)):
             linear = nn.Linear(w.shape[0], w.shape[1])
             # Kerasは(in, out)形状、PyTorchは(out, in)形状
             linear.weight.data = torch.from_numpy(w.T.copy())
             linear.bias.data = torch.from_numpy(b.copy())
             layers.append(linear)
 
-            # 最終層以外はReLUを追加（Keras分類器の一般的な構造）
-            if i < len(keras_weights) - 1:
+            # config.json の activation に従って活性化関数を追加
+            if act == "tanh":
+                layers.append(nn.Tanh())
+            elif act == "relu":
                 layers.append(nn.ReLU())
-
-        # 最終層にSigmoidを追加（NSFW確率出力）
-        layers.append(nn.Sigmoid())
+            elif act == "sigmoid":
+                layers.append(nn.Sigmoid())
+            elif act == "linear":
+                # linear の場合は何も追加しない（恒等関数）
+                pass
+            else:
+                logger.warning(
+                    "未知の活性化関数 '%s' が Layer %d に指定されています。"
+                    "スキップします。",
+                    act, i
+                )
 
         self.mlp = nn.Sequential(*layers)
 
@@ -680,8 +729,8 @@ def build_frozen_classifier(
 
     # 3. Keras分類器の重みをPyTorchに変換
     logger.info("[3/3] pNSFWMedia分類器を読み込み中 ...")
-    keras_weights = _load_keras_classifier_weights(classifier_path)
-    classifier_mlp = PyTorchClassifierMLP(keras_weights)
+    keras_weights, activations = _load_keras_classifier_weights(classifier_path)
+    classifier_mlp = PyTorchClassifierMLP(keras_weights, activations)
 
     # パイプライン組み立て
     model = FrozenNSFWClassifier(

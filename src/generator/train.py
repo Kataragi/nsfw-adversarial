@@ -330,8 +330,10 @@ def evaluate(
         images = images.to(device)
         batch_size = images.shape[0]
 
-        # ジェネレータで摂動済み画像を生成
-        perturbed = generator(images)
+        # ジェネレータで摂動を生成
+        perturbation = generator(images)
+        # 元画像に摂動を加算してクリップ
+        perturbed = torch.clamp(images + perturbation, 0.0, 1.0)
 
         # 分類器で判定
         orig_probs = classifier(images)
@@ -410,8 +412,10 @@ def log_sample_images(
     generator.eval()
     with torch.no_grad():
         samples = images[:num_samples]
-        perturbed = generator(samples)
-        perturbation = perturbed - samples
+        # ジェネレータで摂動を生成
+        perturbation = generator(samples)
+        # 元画像に摂動を加算
+        perturbed = torch.clamp(samples + perturbation, 0.0, 1.0)
 
         # 元画像の分類確率
         orig_probs = classifier(samples).cpu().numpy().flatten()
@@ -622,8 +626,10 @@ def train(config: dict, device_name: str | None = None) -> str:
             batch_size = images.shape[0]
 
             # === 順伝播 ===
-            # ジェネレータで摂動済み画像を生成
-            perturbed = generator(images)
+            # ジェネレータで摂動を生成
+            perturbation = generator(images)
+            # 元画像に摂動を加算
+            perturbed = torch.clamp(images + perturbation, 0.0, 1.0)
 
             # 凍結済み分類器で判定（勾配はジェネレータの出力を通じて逆伝播）
             nsfw_probs = classifier(perturbed)

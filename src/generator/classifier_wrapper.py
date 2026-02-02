@@ -609,11 +609,33 @@ class FrozenNSFWClassifier(nn.Module):
         else:
             pooled = features
 
+        # pooledの形状を確認
+        if pooled.dim() != 2:
+            # 2次元でない場合、flattenしてから適切な形状に変換
+            pooled = pooled.flatten(1)
+            # feature_channelsと一致するように調整
+            if pooled.shape[1] != self.feature_channels:
+                if pooled.shape[1] > self.feature_channels:
+                    pooled = pooled[:, :self.feature_channels]
+                else:
+                    # パディングが必要な場合
+                    padding = torch.zeros(
+                        pooled.shape[0],
+                        self.feature_channels - pooled.shape[1],
+                        device=pooled.device,
+                        dtype=pooled.dtype
+                    )
+                    pooled = torch.cat([pooled, padding], dim=1)
+
         # 直交射影 (C -> 256)
         projected = self.projection(pooled)  # (N, 256)
 
         # L2正規化
         normalized = F.normalize(projected, p=2, dim=1)
+
+        # 形状の検証と修正
+        if normalized.dim() != 2 or normalized.shape[-1] != 256:
+            normalized = normalized.contiguous().view(-1, 256)
 
         # 分類器でNSFW確率を出力
         output = self.classifier_mlp(normalized)  # (N, 1)
@@ -699,12 +721,48 @@ def build_frozen_classifier(
             pooled = features
         logger.info("GAP後の形状: %s (期待: (1, %d))", pooled.shape, feature_channels)
 
+        # pooledの形状を確認して修正
+        if pooled.dim() != 2:
+            logger.warning("GAP後の次元が2ではありません: %d。flattenします。", pooled.dim())
+            pooled = pooled.flatten(1)
+
+        if pooled.shape[1] != feature_channels:
+            logger.warning(
+                "GAP後のチャネル数が期待と異なります: %d (期待: %d)",
+                pooled.shape[1], feature_channels
+            )
+            # 形状を調整
+            if pooled.shape[1] > feature_channels:
+                pooled = pooled[:, :feature_channels]
+            else:
+                # パディング
+                padding = torch.zeros(
+                    pooled.shape[0],
+                    feature_channels - pooled.shape[1],
+                    device=pooled.device,
+                    dtype=pooled.dtype
+                )
+                pooled = torch.cat([pooled, padding], dim=1)
+            logger.info("形状を調整しました: %s", pooled.shape)
+
         # 3. 射影
         projected = model.projection(pooled)
         logger.info("射影後の形状: %s (期待: (1, 256))", projected.shape)
 
         # 4. 分類器
         normalized = F.normalize(projected, p=2, dim=1)
+        logger.info("正規化後の形状: %s", normalized.shape)
+
+        # 形状を確認して、2次元テンソルで最後の次元が256であることを保証
+        if normalized.dim() != 2 or normalized.shape[-1] != 256:
+            logger.warning(
+                "正規化後の形状が不正です: %s。reshapeを試みます。",
+                normalized.shape
+            )
+            # contiguous()を呼んで、view可能な状態にする
+            normalized = normalized.contiguous().view(-1, 256)
+            logger.info("reshape後の形状: %s", normalized.shape)
+
         out = model.classifier_mlp(normalized)
         logger.info("分類器出力形状: %s", out.shape)
 

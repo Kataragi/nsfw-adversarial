@@ -284,6 +284,99 @@ tensorboard --logdir logs/generator
 - 検証セットでの攻撃成功率 (SR@0.5, SR@0.4, SR@0.3)
 - サンプル画像（元画像・摂動済み画像・摂動マップ）
 
+### ジェネレータ推論（学習済みモデルの使用）
+
+訓練済みのジェネレータを使用して、新しいNSFW画像に敵対的摂動を適用します。
+
+```bash
+# 基本的な推論
+python -m src.generator.inference \
+    --generator checkpoints/generator/generator_final.pt \
+    --input_dir dataset/nsfw_images/test \
+    --output_dir results/perturbed
+
+# 分類器での攻撃成功率も検証
+python -m src.generator.inference \
+    --generator checkpoints/generator/generator_final.pt \
+    --input_dir dataset/nsfw_images/test \
+    --output_dir results/perturbed \
+    --verify \
+    --classifier models/target_classifier/pnsfwmedia_classifier.keras
+
+# バッチサイズとデバイスを指定
+python -m src.generator.inference \
+    --generator checkpoints/generator/generator_final.pt \
+    --input_dir dataset/nsfw_images/test \
+    --output_dir results/perturbed \
+    --batch_size 32 \
+    --device cuda \
+    --verify
+
+# 摂動マップを保存せずに実行（高速化）
+python -m src.generator.inference \
+    --generator checkpoints/generator/generator_final.pt \
+    --input_dir dataset/nsfw_images/test \
+    --output_dir results/perturbed \
+    --no_perturbation_maps
+```
+
+#### 推論オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `--generator` | 訓練済みジェネレータの .pt ファイルパス | （必須） |
+| `--input_dir` | 入力画像ディレクトリ | （必須） |
+| `--output_dir` | 出力ディレクトリ | （必須） |
+| `--batch_size` | バッチサイズ | 16 |
+| `--device` | 実行デバイス (cuda/cpu) | cuda (利用可能な場合) |
+| `--max_perturbation` | 摂動の最大値 [0,1]スケール | 16/255 |
+| `--verify` | 分類器で攻撃成功率を検証 | False |
+| `--classifier` | 分類器の .keras ファイルパス | models/target_classifier/pnsfwmedia_classifier.keras |
+| `--threshold` | NSFW判定の閾値 | 0.5 |
+| `--no_perturbation_maps` | 摂動マップを保存しない | False |
+
+#### 出力
+
+推論実行後、以下のファイルが生成されます：
+
+```
+results/perturbed/
+├── perturbed/              # 摂動を適用した画像
+│   ├── image001.jpg
+│   ├── image002.jpg
+│   └── ...
+├── perturbations/          # 摂動マップ（可視化用）
+│   ├── pert_image001.jpg
+│   ├── pert_image002.jpg
+│   └── ...
+└── results.json            # メトリクスと攻撃成功率
+```
+
+#### results.json の内容
+
+```json
+{
+  "total_images": 100,
+  "average_metrics": {
+    "psnr": 38.5,
+    "ssim": 0.98,
+    "l2_distance": 2.34,
+    "linf_distance": 0.0627,
+    "mse": 0.00014
+  },
+  "verification": {
+    "threshold": 0.5,
+    "original_nsfw_count": 95,
+    "perturbed_nsfw_count": 8,
+    "attack_success_count": 87,
+    "attack_success_rate": 0.916,
+    "avg_original_score": 0.87,
+    "avg_perturbed_score": 0.23,
+    "score_reduction": 0.64
+  }
+}
+```
+
 ### ジェネレータの設定パラメータ
 
 | パラメータ | 説明 | 推奨値 |
@@ -320,7 +413,8 @@ nsfw-adversarial/
 │   │   ├── model.py             # UNetジェネレータ (PyTorch)
 │   │   ├── classifier_wrapper.py # 分類器のPyTorchラッパー
 │   │   ├── dataset.py           # NSFW画像データセット
-│   │   └── train.py             # ジェネレータ学習スクリプト
+│   │   ├── train.py             # ジェネレータ学習スクリプト
+│   │   └── inference.py         # ジェネレータ推論スクリプト
 │   ├── image_attacker.py        # 攻撃オーケストレーション
 │   ├── noise_generator.py       # CLI メインスクリプト
 │   ├── evaluate_robustness.py   # ロバスト性評価・可視化

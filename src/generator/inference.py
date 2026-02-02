@@ -113,19 +113,20 @@ def load_generator(
 def load_images_from_directory(
     image_dir: str,
     image_size: int = IMAGE_SIZE,
-    extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png"),
-) -> tuple[list[torch.Tensor], list[str]]:
+    extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp"),
+) -> tuple[list[torch.Tensor], list[str], list[tuple[int, int]]]:
     """ディレクトリから画像を読み込む。
 
     Args:
         image_dir: 画像ディレクトリのパス。
-        image_size: リサイズ後の画像サイズ。
+        image_size: リサイズ後の画像サイズ（推論用に320x320に統一）。
         extensions: 対象とする拡張子。
 
     Returns:
-        (images, filenames) のタプル。
+        (images, filenames, original_sizes) のタプル。
         images: [(3, H, W), ...] のテンソルリスト [0, 1]。
         filenames: ファイル名のリスト。
+        original_sizes: [(width, height), ...] の元サイズリスト。
     """
     logger.info("画像を読み込み中: %s", image_dir)
 
@@ -139,12 +140,17 @@ def load_images_from_directory(
 
     images = []
     filenames = []
+    original_sizes = []
 
     for img_path in tqdm(sorted(image_paths), desc="画像読み込み"):
         try:
             img = Image.open(img_path).convert("RGB")
-            img = img.resize((image_size, image_size), Image.LANCZOS)
-            img_array = np.array(img, dtype=np.float32) / 255.0
+            # 元のサイズを記録
+            original_sizes.append(img.size)  # (width, height)
+
+            # 推論用に320x320にリサイズ
+            img_resized = img.resize((image_size, image_size), Image.LANCZOS)
+            img_array = np.array(img_resized, dtype=np.float32) / 255.0
             img_tensor = torch.from_numpy(img_array).permute(2, 0, 1)  # (3, H, W)
             images.append(img_tensor)
             filenames.append(img_path.name)
@@ -153,7 +159,7 @@ def load_images_from_directory(
             continue
 
     logger.info("%d 枚の画像を読み込みました", len(images))
-    return images, filenames
+    return images, filenames, original_sizes
 
 
 def compute_metrics(
@@ -237,10 +243,24 @@ def save_perturbation_map(
     save_image(pert_scaled, output_path)
 
 
+def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
+    """テンソルを PIL Image に変換する。
+
+    Args:
+        tensor: (3, H, W) [0, 1] の画像テンソル。
+
+    Returns:
+        PIL Image オブジェクト。
+    """
+    img_array = (tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    return Image.fromarray(img_array)
+
+
 def run_inference(
     generator: AdversarialGenerator,
     images: list[torch.Tensor],
     filenames: list[str],
+    original_sizes: list[tuple[int, int]],
     output_dir: str,
     batch_size: int = 16,
     device: str = "cuda",
@@ -250,8 +270,9 @@ def run_inference(
 
     Args:
         generator: AdversarialGenerator モデル。
-        images: 画像テンソルのリスト。
+        images: 画像テンソルのリスト（320x320にリサイズ済み）。
         filenames: ファイル名のリスト。
+        original_sizes: [(width, height), ...] の元サイズリスト。
         output_dir: 出力ディレクトリ。
         batch_size: バッチサイズ。
         device: 実行デバイス。
@@ -277,34 +298,41 @@ def run_inference(
         for i in tqdm(range(0, len(images), batch_size), desc="バッチ推論"):
             batch_images = images[i : i + batch_size]
             batch_filenames = filenames[i : i + batch_size]
+            batch_sizes = original_sizes[i : i + batch_size]
 
             # バッチテンソルの作成
             batch_tensor = torch.stack(batch_images).to(device)
 
-            # ジェネレータによる摂動の適用
-            perturbed_batch = generator(batch_tensor)
+            # ジェネレータで摂動を生成
+            perturbation_batch = generator(batch_tensor)
+            # 元画像に摂動を加算
+            perturbed_batch = torch.clamp(batch_tensor + perturbation_batch, 0.0, 1.0)
 
             # 各画像を保存してメトリクスを計算
-            for j, (orig, pert, fname) in enumerate(
-                zip(batch_tensor, perturbed_batch, batch_filenames)
+            for j, (orig, pert, perturbation, fname, orig_size) in enumerate(
+                zip(batch_tensor, perturbed_batch, perturbation_batch, batch_filenames, batch_sizes)
             ):
-                # 摂動画像の保存
+                # 摂動画像を元のサイズにリサイズして保存
+                pert_pil = tensor_to_pil(pert.cpu())
+                pert_pil_resized = pert_pil.resize(orig_size, Image.LANCZOS)
                 perturbed_path = os.path.join(perturbed_dir, fname)
-                save_image(pert, perturbed_path)
+                pert_pil_resized.save(perturbed_path)
+
+                # 320x320 の摂動画像を記録（分類器検証用）
                 perturbed_images.append(pert.cpu())
 
-                # 摂動マップの保存
+                # 摂動マップの保存（320x320で保存）
                 if save_perturbation_maps:
-                    perturbation = pert - orig
                     pert_map_path = os.path.join(
                         perturbation_dir,
                         f"pert_{fname}",
                     )
-                    save_perturbation_map(perturbation, pert_map_path)
+                    save_perturbation_map(perturbation.cpu(), pert_map_path)
 
-                # メトリクスの計算
+                # メトリクスの計算（320x320で計算）
                 metrics = compute_metrics(orig.cpu(), pert.cpu())
                 metrics["filename"] = fname
+                metrics["original_size"] = orig_size
                 all_metrics.append(metrics)
 
     # 平均メトリクスの計算
@@ -501,14 +529,15 @@ def main() -> None:
         max_perturbation=args.max_perturbation,
     )
 
-    # 画像の読み込み
-    images, filenames = load_images_from_directory(args.input_dir)
+    # 画像の読み込み（元サイズも記録）
+    images, filenames, original_sizes = load_images_from_directory(args.input_dir)
 
     # 推論の実行
     perturbed_images, metrics_summary = run_inference(
         generator=generator,
         images=images,
         filenames=filenames,
+        original_sizes=original_sizes,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         device=args.device,

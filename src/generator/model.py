@@ -195,13 +195,17 @@ class AdversarialGenerator(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """順伝播: NSFW画像 -> 摂動済み画像。
+        """順伝播: NSFW画像 -> 摂動δ。
 
         Args:
             x: (N, 3, H, W) float32 [0, 1] 元のNSFW画像。
 
         Returns:
-            (N, 3, H, W) float32 [0, 1] 摂動済み画像。
+            (N, 3, H, W) 摂動δ [-max_perturbation, +max_perturbation]。
+
+        注意:
+            元画像との合成 (x + perturbation) は呼び出し側で行う。
+            これにより、摂動のみの取得や可視化が容易になる。
         """
         # 初期特徴抽出
         feat = self.input_conv(x)
@@ -222,21 +226,8 @@ class AdversarialGenerator(nn.Module):
             feat = decoder(feat, skip)
 
         # 摂動マップの生成 [-max_pert, +max_pert]
+        # tanh で [-1, 1] に制限し、max_perturbation でスケール
         perturbation = self.output_conv(feat) * self.max_perturbation
 
-        # 元画像に摂動を加算し [0, 1] にクリップ
-        perturbed = torch.clamp(x + perturbation, 0.0, 1.0)
-
-        return perturbed
-
-    def get_perturbation(self, x: torch.Tensor) -> torch.Tensor:
-        """摂動のみを返す（可視化用）。
-
-        Args:
-            x: (N, 3, H, W) float32 [0, 1] 元のNSFW画像。
-
-        Returns:
-            (N, 3, H, W) 摂動マップ（元画像との差分）。
-        """
-        perturbed = self.forward(x)
-        return perturbed - x
+        # 摂動δのみを返す（元画像との加算は呼び出し側で行う）
+        return perturbation

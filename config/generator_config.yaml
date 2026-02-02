@@ -38,7 +38,7 @@ training:
   # 損失関数の重み
   lambda_cls: 1.0             # 分類損失の重み（NSFWをSFWに誤分類させる）
   lambda_l2: 10.0             # L2摂動ペナルティの重み
-  lambda_lpips: 0.0           # LPIPS知覚損失の重み（0で無効化）
+  lambda_lpips: 1.0           # LPIPS知覚損失の重み（知覚的類似度を保持）
 
   # 分類損失のターゲット
   target_prob: 0.0            # SFW を意味する目標確率

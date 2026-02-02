@@ -422,10 +422,12 @@ def _load_keras_classifier_weights(
 
                     # HDF5 内での層の探索パス候補
                     # Keras 3.x では以下のパターンが考えられる：
+                    # - layers/<layer_name>/vars/0 (kernel), layers/<layer_name>/vars/1 (bias)
                     # - vars/<layer_name>/0/kernel:0, vars/<layer_name>/0/bias:0
                     # - vars/<layer_name>/kernel:0, vars/<layer_name>/bias:0
                     # - <layer_name>/kernel:0, <layer_name>/bias:0
                     kernel_paths = [
+                        f"layers/{layer_name}/vars/0",  # Keras 3.x common pattern
                         f"vars/{layer_name}/0/kernel:0",
                         f"vars/{layer_name}/kernel:0",
                         f"{layer_name}/kernel:0",
@@ -433,6 +435,7 @@ def _load_keras_classifier_weights(
                         f"vars/{layer_name}/0",
                     ]
                     bias_paths = [
+                        f"layers/{layer_name}/vars/1",  # Keras 3.x common pattern
                         f"vars/{layer_name}/0/bias:0",
                         f"vars/{layer_name}/bias:0",
                         f"{layer_name}/bias:0",

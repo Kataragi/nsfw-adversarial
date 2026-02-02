@@ -364,6 +364,7 @@ def run_inference(
 def verify_with_classifier(
     original_images: list[torch.Tensor],
     perturbed_images: list[torch.Tensor],
+    filenames: list[str],
     classifier_path: str,
     device: str = "cuda",
     threshold: float = 0.5,
@@ -373,6 +374,7 @@ def verify_with_classifier(
     Args:
         original_images: 元画像のリスト。
         perturbed_images: 摂動画像のリスト。
+        filenames: ファイル名のリスト。
         classifier_path: 分類器の .keras ファイルパス。
         device: 実行デバイス。
         threshold: NSFW判定の閾値。
@@ -394,19 +396,43 @@ def verify_with_classifier(
 
     original_predictions = []
     perturbed_predictions = []
+    per_image_results = []
 
     with torch.no_grad():
-        # 元画像の予測
-        for img in tqdm(original_images, desc="元画像の分類"):
-            img_batch = img.unsqueeze(0).to(device)  # (1, 3, H, W)
-            pred = classifier(img_batch).cpu().item()
-            original_predictions.append(pred)
+        # 元画像と摂動画像の予測を同時に処理
+        for idx, (orig_img, pert_img, fname) in enumerate(
+            zip(tqdm(original_images, desc="分類器で検証中"), perturbed_images, filenames)
+        ):
+            # 元画像の予測
+            orig_batch = orig_img.unsqueeze(0).to(device)  # (1, 3, H, W)
+            orig_pred = classifier(orig_batch).cpu().item()
+            original_predictions.append(orig_pred)
 
-        # 摂動画像の予測
-        for img in tqdm(perturbed_images, desc="摂動画像の分類"):
-            img_batch = img.unsqueeze(0).to(device)  # (1, 3, H, W)
-            pred = classifier(img_batch).cpu().item()
-            perturbed_predictions.append(pred)
+            # 摂動画像の予測
+            pert_batch = pert_img.unsqueeze(0).to(device)  # (1, 3, H, W)
+            pert_pred = classifier(pert_batch).cpu().item()
+            perturbed_predictions.append(pert_pred)
+
+            # 個別の結果を記録
+            per_image_results.append({
+                "filename": fname,
+                "original_score": orig_pred,
+                "perturbed_score": pert_pred,
+                "score_reduction": orig_pred - pert_pred,
+                "attack_success": orig_pred >= threshold and pert_pred < threshold,
+            })
+
+            # ログ出力（各画像のスコア）
+            logger.info(
+                "[%d/%d] %s: NSFW %.4f -> %.4f (減少: %.4f) %s",
+                idx + 1,
+                len(original_images),
+                fname,
+                orig_pred,
+                pert_pred,
+                orig_pred - pert_pred,
+                "✓ 成功" if (orig_pred >= threshold and pert_pred < threshold) else ""
+            )
 
     # 攻撃成功率の計算
     original_nsfw = [p >= threshold for p in original_predictions]
@@ -437,6 +463,7 @@ def verify_with_classifier(
         "avg_original_score": avg_original_score,
         "avg_perturbed_score": avg_perturbed_score,
         "score_reduction": score_reduction,
+        "per_image_results": per_image_results,
         "predictions": {
             "original": original_predictions,
             "perturbed": perturbed_predictions,
@@ -498,15 +525,15 @@ def main() -> None:
         help="摂動の最大値 (デフォルト: 16/255)",
     )
     parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="分類器で攻撃成功率を検証する",
-    )
-    parser.add_argument(
         "--classifier",
         type=str,
         default="models/target_classifier/pnsfwmedia_classifier.keras",
         help="分類器の .keras ファイルパス (デフォルト: models/target_classifier/pnsfwmedia_classifier.keras)",
+    )
+    parser.add_argument(
+        "--no_verify",
+        action="store_true",
+        help="分類器での検証をスキップする",
     )
     parser.add_argument(
         "--threshold",
@@ -544,11 +571,12 @@ def main() -> None:
         save_perturbation_maps=not args.no_perturbation_maps,
     )
 
-    # 分類器での検証（オプション）
-    if args.verify:
+    # 分類器での検証（デフォルトで有効）
+    if not args.no_verify:
         verification_results = verify_with_classifier(
             original_images=images,
             perturbed_images=perturbed_images,
+            filenames=filenames,
             classifier_path=args.classifier,
             device=args.device,
             threshold=args.threshold,

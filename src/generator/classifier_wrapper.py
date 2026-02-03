@@ -241,69 +241,54 @@ def convert_backbone_to_pytorch(
     nudenet_onnx_path: str | None = None,
     cache_dir: str = "models/torch_backbone",
 ) -> tuple[nn.Module, int]:
-    """NudeNetバックボーンをONNXからPyTorchモデルに変換する。
+    """Ultralytics YOLOv8n を backbone として使用する。
 
     Args:
-        nudenet_onnx_path: NudeNet best.onnx のパス。Noneの場合は自動検出。
-        cache_dir: 変換済みモデルのキャッシュディレクトリ。
+        nudenet_onnx_path: 使用しない（互換性のため残す）。
+        cache_dir: 使用しない（互換性のため残す）。
 
     Returns:
-        (backbone_module, feature_channels) のタプル。
+        (backbone, feature_channels) のタプル。
+        - backbone: YOLOv8n の特徴抽出部分
+        - feature_channels: 出力チャネル数
     """
-    import onnx
+    logger.info("Ultralytics YOLOv8n をbackboneとして読み込み中...")
 
-    # onnx2torch はインポート時にのみ必要
-    from onnx2torch import convert
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        raise ImportError(
+            "ultralytics パッケージが見つかりません。"
+            "pip install ultralytics でインストールしてください。"
+        )
 
-    os.makedirs(cache_dir, exist_ok=True)
-    meta_path = os.path.join(cache_dir, "backbone_meta.json")
-    pt_path = os.path.join(cache_dir, "backbone.pt")
+    # YOLOv8n（最小モデル）を読み込み
+    # 初回実行時に ~/.cache/ultralytics/ に自動ダウンロード
+    yolo_model = YOLO('yolov8n.pt')
 
-    # キャッシュが存在する場合はそれを使用
-    if os.path.exists(pt_path) and os.path.exists(meta_path):
-        logger.info("キャッシュ済みPyTorchバックボーンを使用: %s", cache_dir)
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-        backbone = torch.load(pt_path, map_location="cpu", weights_only=False)
-        backbone.eval()
-        return backbone, meta["feature_channels"]
+    # backbone 部分だけを抽出
+    # YOLOv8 の model.model は nn.Sequential で、
+    # 最初の 10 層程度が backbone（C2f層まで）
+    backbone_layers = list(yolo_model.model.model[:10])
+    backbone = nn.Sequential(*backbone_layers)
 
-    if nudenet_onnx_path is None:
-        nudenet_onnx_path = find_nudenet_onnx()
+    # 出力チャネル数を確認（ダミー入力で）
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, 320, 320)
+        out = backbone(dummy)
+        # 出力形状: (1, C, H, W)
+        feature_channels = out.shape[1]
 
-    # 1. バックボーンONNXを先に抽出（フルモデル推論の Concat エラーを回避）
-    backbone_onnx = os.path.join(cache_dir, "backbone.onnx")
-    _extract_backbone_onnx(nudenet_onnx_path, backbone_onnx)
+    logger.info("YOLOv8n backbone 読み込み完了")
+    logger.info("  出力形状: %s", out.shape)
+    logger.info("  特徴チャネル数: %d", feature_channels)
 
-    # 2. 抽出済みバックボーンから特徴次元を取得
-    feat_shape = _get_backbone_feature_dim_from_extracted(backbone_onnx)
-    feature_channels = int(feat_shape[1])
-    logger.info(
-        "バックボーン特徴形状 (NCHW): %s  チャネル数=%d",
-        feat_shape,
-        feature_channels,
-    )
+    # 全パラメータを凍結
+    for param in backbone.parameters():
+        param.requires_grad = False
 
-    # ONNX -> PyTorch変換
-    logger.info("バックボーンONNX -> PyTorch変換中 ...")
-    onnx_model = onnx.load(backbone_onnx)
-    backbone = convert(onnx_model)
     backbone.eval()
 
-    # キャッシュに保存
-    torch.save(backbone, pt_path)
-    onnx_full = onnx.load(nudenet_onnx_path)
-    backbone_node = _find_backbone_node(onnx_full)
-    meta = {
-        "backbone_node": backbone_node,
-        "feature_channels": feature_channels,
-        "feature_shape_nchw": list(feat_shape),
-        "image_size": IMAGE_SIZE,
-    }
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-
-    logger.info("バックボーン変換完了 -> %s", cache_dir)
     return backbone, feature_channels
 
 

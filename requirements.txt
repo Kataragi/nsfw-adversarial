@@ -19,6 +19,7 @@ opencv-python-headless>=4.8.0
 
 # ── NSFW分類器バックボーン ──
 nudenet>=3.4.0
+ultralytics>=8.1.0
 
 # ── 数値計算・可視化 ──
 numpy>=1.26.4
